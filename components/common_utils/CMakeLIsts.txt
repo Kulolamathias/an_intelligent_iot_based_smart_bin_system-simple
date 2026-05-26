@@ -1,0 +1,9 @@
+idf_component_register(
+    SRCS
+        "src/geo_utils.c"
+        "src/location_lookup.c"
+
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+)

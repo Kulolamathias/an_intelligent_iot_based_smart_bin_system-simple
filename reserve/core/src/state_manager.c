@@ -1,0 +1,1220 @@
+/**
+ * @file state_manager.c
+ * @brief State Manager – Deterministic Transition Engine
+ *
+ * =============================================================================
+ * ARCHITECTURAL DOCTRINE – READ CAREFULLY
+ * =============================================================================
+ * This file contains the COMPLETE BEHAVIORAL SPECIFICATION of the system.
+ *
+ * All possible system reactions are encoded in the static transition table.
+ * The table is evaluated TOP TO BOTTOM; THE FIRST MATCHING RULE WINS.
+ *
+ * DECISION RULES:
+ *   - Conditions must read ONLY from system_context_t.
+ *   - Events are FACTS; they never directly influence decisions.
+ *   - Command batches are executed strictly sequentially.
+ *
+ * EXTENSIBILITY MODEL:
+ *   - New behavior is added by APPENDING new entries to g_transition_table.
+ *   - Existing rules are NEVER modified (unless correcting a bug).
+ *   - No dynamic rule registration – all decisions are compile-time.
+ *
+ * =============================================================================
+ * INVARIANTS
+ * =============================================================================
+ * 1. system_state_get() is the sole source of current state.
+ * 2. Context is updated BEFORE transition evaluation.
+ * 3. No event payload data is used in conditions – only context.
+ * 4. Every transition rule changes state OR remains in same state.
+ * 5. Command parameters are allocated on stack and never persist.
+ *
+ * =============================================================================
+ * @version 1.0.0
+ * @author Core Architecture Group
+ * =============================================================================
+ */
+
+#include "state_manager.h"
+#include "command_router.h"
+#include "command_params.h"
+#include "system_state.h"
+#include "esp_log.h"
+#include <string.h>
+#include <stdio.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+
+#define MAX_COMMANDS_PER_TRANSITION 12
+
+/* Helper macro to define a command batch with automatic count */
+#define COMMAND_BATCH(...) \
+    { \
+        .commands = { __VA_ARGS__ }, \
+        .count = sizeof((transition_command_t[]){ __VA_ARGS__ }) / sizeof(transition_command_t) \
+    }
+
+/**
+ * @brief Empty command batch – no commands.
+ */
+#define COMMAND_BATCH_EMPTY { .commands = {}, .count = 0 }
+
+
+#define GUIDANCE_TIMEOUT_MS 10000    /**< 10 seconds, change as needed */
+
+    
+static const char *TAG = "StateManager";
+
+/* ---------- Thread‑safe context access ---------- */
+static SemaphoreHandle_t s_context_mutex = NULL;
+
+/* ============================================================
+ * INTERNAL TYPE DEFINITIONS – TRANSITION RULE COMPONENTS
+ * ============================================================ */
+
+/**
+ * @brief Function that prepares command parameters.
+ * 
+ * Called during command batch execution. Writes parameter data
+ * into a stack-allocated union. Must be NULL if command needs no params.
+ * 
+ * @param ctx      Current system context (read-only)
+ * @param event    Original event (may be NULL if not event-triggered)
+ * @param params_out Pointer to command_param_union_t buffer
+ */
+typedef void (*param_preparer_t)(const system_context_t *ctx,
+                                 const system_event_t *event,
+                                 void *params_out);
+
+/**
+ * @brief A single command inside a transition batch.
+ */
+typedef struct {
+    system_command_id_t cmd;            /**< Command to execute */
+    param_preparer_t    prepare_params; /**< Parameter filler (may be NULL) */
+} transition_command_t;
+
+/**
+ * @brief Batch of commands to execute after a transition.
+ */
+typedef struct {
+    transition_command_t commands[MAX_COMMANDS_PER_TRANSITION];
+    uint8_t count;                    /**< Number of valid commands */
+} command_batch_t;
+
+/**
+ * @brief Condition function – must return true for rule to match.
+ * 
+ * IMPORTANT: Must read ONLY from system_context_t.
+ * Event parameter is provided for completeness but MUST NOT be used.
+ */
+typedef bool (*transition_condition_t)(const system_context_t *ctx,
+                                       const system_event_t *event);
+
+/**
+ * @brief Complete state transition rule.
+ */
+typedef struct {
+    system_state_t          current_state;  /**< Required starting state */
+    system_event_id_t       event_id;        /**< Required event */
+    transition_condition_t  condition;       /**< Additional predicate (may be NULL) */
+    system_state_t          next_state;      /**< State after transition */
+    command_batch_t         command_batch;   /**< Actions to execute */
+} state_transition_rule_t;
+
+/* ============================================================
+ * STATIC CONTEXT – SINGLE INSTANCE
+ * ============================================================ */
+static system_context_t g_context;
+
+
+/* ============================================================
+ * PARAMETER PREPARERS – COMMAND DATA PACKING
+ *
+ * These functions fill the parameter structures defined in command_params.h.
+ * They are called only when a command that requires parameters is executed.
+ * ============================================================ */
+
+
+static esp_err_t context_lock_init(void);
+
+static void prepare_intent_timer(const system_context_t *ctx, const system_event_t *event, void *params_out)
+{
+    (void)ctx; (void)event;
+    cmd_start_timer_params_t *p = params_out;
+    p->timeout_ms = 5000;
+}
+static void prepare_escalation_timer(const system_context_t *ctx, const system_event_t *event, void *params_out)
+{
+    (void)ctx; (void)event;
+    cmd_start_timer_params_t *p = params_out;
+    p->timeout_ms = 3600000; /* 1 hour */
+}
+static void prepare_guidance_timer(const system_context_t *ctx, const system_event_t *event, void *params_out)
+{
+    (void)ctx;
+    (void)event;
+    cmd_start_timer_ex_params_t *p = (cmd_start_timer_ex_params_t *)params_out;
+    p->timeout_ms = GUIDANCE_TIMEOUT_MS;
+    p->event_id = EVENT_GUIDANCE_TIMEOUT;
+}
+static void prepare_near_full_notification(const system_context_t *ctx, const system_event_t *event, void *params_out)
+{
+    (void)event;
+    cmd_send_notification_params_t *p = params_out;
+    snprintf(p->message, sizeof(p->message), "Bin near full: %d%%", ctx->bin_fill_level_percent);
+    p->is_escalation = false;
+}
+static void prepare_full_notification(const system_context_t *ctx, const system_event_t *event, void *params_out)
+{
+    (void)event;
+    cmd_send_notification_params_t *p = params_out;
+    snprintf(p->message, sizeof(p->message), "Bin FULL at %d%%", ctx->bin_fill_level_percent);
+    p->is_escalation = true;
+}
+static void prepare_empty_notification(const system_context_t *ctx, const system_event_t *event, void *params_out)
+{
+    (void)event;
+    cmd_send_notification_params_t *p = params_out;
+    snprintf(p->message, sizeof(p->message), "Bin emptied (now %d%%)", ctx->bin_fill_level_percent);
+    p->is_escalation = false;
+}
+static void prepare_auth_success_response(const system_context_t *ctx, const system_event_t *event, void *params_out)
+{
+    (void)ctx;
+    cmd_send_sms_params_t *p = (cmd_send_sms_params_t *)params_out;
+    
+    if (event == NULL) {
+        snprintf(p->message, sizeof(p->message), "Authentication successful (no sender)");
+        p->phone_number[0] = '\0';
+        return;
+    }
+    
+    const char *sender = event->data.gsm_command.sender;
+    strlcpy(p->phone_number, sender, sizeof(p->phone_number));
+    snprintf(p->message, sizeof(p->message), "Authentication successful. Bin unlocked for maintenance.");
+}
+static void prepare_show_full_message(const system_context_t *ctx, const system_event_t *event, void *params_out)
+{
+    (void)ctx; (void)event;
+    cmd_show_message_params_t *p = params_out;
+    snprintf(p->line1, sizeof(p->line1), "BIN FULL");
+    snprintf(p->line2, sizeof(p->line2), "Use another bin");
+}
+
+static void prepare_set_wifi_state(const system_context_t *ctx, const system_event_t *event, void *params_out)
+{
+    (void)ctx; (void)event;
+    uint32_t *state = params_out;
+    *state = 1;   // WiFi connected
+}
+
+static void prepare_escalation_message(const system_context_t *ctx, const system_event_t *event, void *params_out)
+{
+    (void)ctx; (void)event;
+    cmd_send_notification_params_t *p = params_out;
+    snprintf(p->message, sizeof(p->message), "ALERT: Bin at %d%% full, collector did not respond. Escalating to manager.", ctx->bin_fill_level_percent);
+    p->is_escalation = true;
+}
+
+/* ============================================================
+ * LED PARAMETER PREPARERS
+ * ============================================================ */
+
+static void prepare_led_blink_attention(const system_context_t *ctx,
+                                        const system_event_t *event,
+                                        void *params_out)
+{
+    (void)ctx; (void)event;
+    led_blink_params_t *p = params_out;
+    p->led_id = 0;               /* white LED */
+    p->period_ms = 500;
+    p->duty_percent = 50;
+}
+
+static void prepare_led_blink_slow(const system_context_t *ctx,
+                                   const system_event_t *event,
+                                   void *params_out)
+{
+    (void)ctx; (void)event;
+    led_blink_params_t *p = params_out;
+    p->led_id = 2;               /* yellow LED */
+    p->period_ms = 1000;
+    p->duty_percent = 50;
+}
+
+static void prepare_led_blink_fast(const system_context_t *ctx,
+                                   const system_event_t *event,
+                                   void *params_out)
+{
+    (void)ctx; (void)event;
+    led_blink_params_t *p = params_out;
+    p->led_id = 3;               /* red LED */
+    p->period_ms = 200;
+    p->duty_percent = 50;
+}
+
+static void prepare_led_on_green(const system_context_t *ctx,
+                                 const system_event_t *event,
+                                 void *params_out)
+{
+    (void)ctx; (void)event;
+    led_brightness_params_t *p = params_out;
+    p->led_id = 1;               /* green LED */
+    p->percent = 100;
+}
+
+static void prepare_led_on_blue(const system_context_t *ctx,
+                                const system_event_t *event,
+                                void *params_out)
+{
+    (void)ctx; (void)event;
+    led_brightness_params_t *p = params_out;
+    p->led_id = 4;               /* blue LED */
+    p->percent = 100;
+}
+
+static void prepare_led_off_white(const system_context_t *ctx,
+                                  const system_event_t *event,
+                                  void *params_out)
+{
+    (void)ctx; (void)event;
+    led_id_params_t *p = params_out;
+    p->led_id = 0;
+}
+
+static void prepare_led_off_green(const system_context_t *ctx,
+                                  const system_event_t *event,
+                                  void *params_out)
+{
+    (void)ctx; (void)event;
+    led_id_params_t *p = params_out;
+    p->led_id = 1;
+}
+
+static void prepare_led_off_yellow(const system_context_t *ctx,
+                                   const system_event_t *event,
+                                   void *params_out)
+{
+    (void)ctx; (void)event;
+    led_id_params_t *p = params_out;
+    p->led_id = 2;
+}
+
+static void prepare_led_off_red(const system_context_t *ctx,
+                                const system_event_t *event,
+                                void *params_out)
+{
+    (void)ctx; (void)event;
+    led_id_params_t *p = params_out;
+    p->led_id = 3;
+}
+
+static void prepare_led_off_blue(const system_context_t *ctx,
+                                 const system_event_t *event,
+                                 void *params_out)
+{
+    (void)ctx; (void)event;
+    led_id_params_t *p = params_out;
+    p->led_id = 4;
+}
+
+
+/* ------------------------------------------------------------
+ * BUZZER PARAMETER PREPARERS
+ * ------------------------------------------------------------ */
+
+/* on power-up/booting... */
+static void prepare_buzzer_pattern_power_up(const system_context_t *ctx,
+                                            const system_event_t *event,
+                                            void *params_out)
+{
+    (void)ctx; (void)event;
+    buzzer_pattern_params_t *p = params_out;
+    p->buzzer_id = 0;
+    p->pattern_id = 12;   // power-up pattern
+}
+
+/* Person detected → friendly chirp (attention) */
+static void prepare_buzzer_pattern_attention(const system_context_t *ctx,
+                                             const system_event_t *event,
+                                             void *params_out)
+{
+    (void)ctx; (void)event;
+    buzzer_pattern_params_t *p = params_out;
+    p->buzzer_id = 0;
+    p->pattern_id = 4;   /* friendly chirp */
+}
+
+/* Intention confirmed → success arpeggio */
+static void prepare_buzzer_pattern_success(const system_context_t *ctx,
+                                           const system_event_t *event,
+                                           void *params_out)
+{
+    (void)ctx; (void)event;
+    buzzer_pattern_params_t *p = params_out;
+    p->buzzer_id = 0;
+    p->pattern_id = 5;   /* success arpeggio */
+}
+
+/* Lid closed → gentle fade */
+static void prepare_buzzer_gentle_fade(const system_context_t *ctx,
+                                       const system_event_t *event,
+                                       void *params_out)
+{
+    (void)ctx; (void)event;
+    buzzer_pattern_params_t *p = params_out;
+    p->buzzer_id = 0;
+    p->pattern_id = 6;   /* gentle fade */
+}
+
+/* Intent timeout/person left → gentle fade (same) */
+static void prepare_buzzer_gentle_fade_same(const system_context_t *ctx,
+                                            const system_event_t *event,
+                                            void *params_out)
+{
+    (void)ctx; (void)event;
+    buzzer_pattern_params_t *p = params_out;
+    p->buzzer_id = 0;
+    p->pattern_id = 6;
+}
+
+/* Near full → warning pulse */
+static void prepare_buzzer_warning_pulse(const system_context_t *ctx,
+                                         const system_event_t *event,
+                                         void *params_out)
+{
+    (void)ctx; (void)event;
+    buzzer_pattern_params_t *p = params_out;
+    p->buzzer_id = 0;
+    p->pattern_id = 7;   /* warning pulse */
+}
+
+/* Full → urgent alarm */
+static void prepare_buzzer_urgent_alarm(const system_context_t *ctx,
+                                        const system_event_t *event,
+                                        void *params_out)
+{
+    (void)ctx; (void)event;
+    buzzer_pattern_params_t *p = params_out;
+    p->buzzer_id = 0;
+    p->pattern_id = 8;   /* urgent alarm */
+}
+
+/* Escalation timeout → escalating siren */
+static void prepare_buzzer_escalating_siren(const system_context_t *ctx,
+                                            const system_event_t *event,
+                                            void *params_out)
+{
+    (void)ctx; (void)event;
+    buzzer_pattern_params_t *p = params_out;
+    p->buzzer_id = 0;
+    p->pattern_id = 9;   /* escalating siren */
+}
+
+/* Maintenance granted → calming chord */
+static void prepare_buzzer_calming_chord(const system_context_t *ctx,
+                                         const system_event_t *event,
+                                         void *params_out)
+{
+    (void)ctx; (void)event;
+    buzzer_pattern_params_t *p = params_out;
+    p->buzzer_id = 0;
+    p->pattern_id = 10;  /* calming chord */
+}
+
+/* Error → error glissando */
+static void prepare_buzzer_error_glissando(const system_context_t *ctx,
+                                           const system_event_t *event,
+                                           void *params_out)
+{
+    (void)ctx; (void)event;
+    buzzer_pattern_params_t *p = params_out;
+    p->buzzer_id = 0;
+    p->pattern_id = 11;  /* error glissando */
+}
+
+/* buzzer off*/
+static void prepare_buzzer_off(const system_context_t *ctx,
+                               const system_event_t *event,
+                               void *params_out)
+{
+    (void)ctx; (void)event;
+    buzzer_off_params_t *p = params_out;
+    p->buzzer_id = 0;
+}
+
+/* ============================================================
+ * LCD message preparers
+ * ============================================================ */
+
+static void prepare_no_peer_message(const system_context_t *ctx, const system_event_t *event, void *params_out)
+{
+    (void)ctx;
+    (void)event;
+    cmd_show_message_params_t *p = params_out;
+    snprintf(p->line1, sizeof(p->line1), "No other bin");
+    snprintf(p->line2, sizeof(p->line2), "available");
+}
+
+static void prepare_lcd_message(const system_context_t *ctx, const system_event_t *event, void *params_out)
+{
+    (void)ctx;
+    cmd_show_message_params_t *p = params_out;
+    const lcd_message_t *msg = &event->data.lcd_message;
+    strlcpy(p->line1, msg->line1, sizeof(p->line1));
+    strlcpy(p->line2, msg->line2, sizeof(p->line2));
+}
+
+static void prepare_welcome_message(const system_context_t *ctx,
+                                    const system_event_t *event,
+                                    void *params_out)
+{
+    (void)ctx; (void)event;
+    cmd_show_message_params_t *p = params_out;
+    snprintf(p->line1, sizeof(p->line1), "Welcome");
+    p->line2[0] = '\0';
+}
+
+static void prepare_attention_message(const system_context_t *ctx,
+                                      const system_event_t *event,
+                                      void *params_out)
+{
+    (void)ctx; (void)event;
+    cmd_show_message_params_t *p = params_out;
+    snprintf(p->line1, sizeof(p->line1), "Raise waste");
+    snprintf(p->line2, sizeof(p->line2), "to open");
+}
+
+static void prepare_processing_message(const system_context_t *ctx,
+                                       const system_event_t *event,
+                                       void *params_out)
+{
+    (void)ctx; (void)event;
+    cmd_show_message_params_t *p = params_out;
+    snprintf(p->line1, sizeof(p->line1), "Lid open");
+    snprintf(p->line2, sizeof(p->line2), "Dispose waste");
+}
+
+static void prepare_thank_you_message(const system_context_t *ctx,
+                                      const system_event_t *event,
+                                      void *params_out)
+{
+    (void)ctx; (void)event;
+    cmd_show_message_params_t *p = params_out;
+    snprintf(p->line1, sizeof(p->line1), "Thank you");
+    p->line2[0] = '\0';
+}
+
+static void prepare_near_full_message(const system_context_t *ctx,
+                                      const system_event_t *event,
+                                      void *params_out)
+{
+    (void)ctx; (void)event;
+    cmd_show_message_params_t *p = params_out;
+    snprintf(p->line1, sizeof(p->line1), "Bin near full");
+    snprintf(p->line2, sizeof(p->line2), "Will lock soon");
+}
+
+static void prepare_maintenance_message(const system_context_t *ctx,
+                                        const system_event_t *event,
+                                        void *params_out)
+{
+    (void)ctx; (void)event;
+    cmd_show_message_params_t *p = params_out;
+    snprintf(p->line1, sizeof(p->line1), "Maintenance mode");
+    p->line2[0] = '\0';
+}
+
+static void prepare_error_message(const system_context_t *ctx,
+                                  const system_event_t *event,
+                                  void *params_out)
+{
+    (void)ctx; (void)event;
+    cmd_show_message_params_t *p = params_out;
+    snprintf(p->line1, sizeof(p->line1), "ERROR");
+    snprintf(p->line2, sizeof(p->line2), "Check system");
+}
+
+/* ============================================================
+ * LCD message preparer for bin redirect (when bin is full)
+ * ============================================================ */
+static void prepare_redirect_message(const system_context_t *ctx, const system_event_t *event, void *params_out)
+{
+    (void)ctx;
+    cmd_show_message_params_t *p = (cmd_show_message_params_t *)params_out;
+    const redirect_info_t *info = &event->data.redirect_info;
+
+    /* Line 1: "Use X" where X is location name (max 16 chars) or bin ID (max 12 chars) */
+    if (info->location_name[0] != '\0') {
+        /* Truncate location name to 16 characters to fit "Use " + name + null */
+        char truncated_name[17];
+        strncpy(truncated_name, info->location_name, sizeof(truncated_name) - 1);
+        truncated_name[sizeof(truncated_name) - 1] = '\0';
+        snprintf(p->line1, sizeof(p->line1), "Use %s", truncated_name);
+    } else {
+        /* Bin ID is at most 12 chars, so "Bin " + 12 + null = 16, safe */
+        snprintf(p->line1, sizeof(p->line1), "Bin %s", info->peer_id);
+    }
+
+    /* Line 2: distance and direction */
+    if (info->direction[0] != '?' && info->direction[0] != '\0') {
+        /* Format: "~123m NE" – distance up to 9999 (4 digits) + "m " + 2 chars = ~10 bytes, safe */
+        snprintf(p->line2, sizeof(p->line2), "~%.0fm %s", info->distance, info->direction);
+    } else {
+        /* No direction: "~123m" – safe */
+        snprintf(p->line2, sizeof(p->line2), "~%.0fm", info->distance);
+    }
+
+    /* Ensure lines are null‑terminated (snprintf already does) */
+}
+
+static void prepare_welcome_timer(const system_context_t *ctx, 
+                                  const system_event_t *event, 
+                                  void *params_out)
+{
+    (void)ctx; (void)event;
+    cmd_start_timer_ex_params_t *p = params_out;
+    p->timeout_ms = 2000;               // 2 seconds
+    p->event_id = EVENT_WELCOME_TIMEOUT;
+}
+
+static void prepare_boot_notification(const system_context_t *ctx, const system_event_t *event, void *params_out)
+{
+    (void)ctx; (void)event;
+    cmd_send_notification_params_t *p = (cmd_send_notification_params_t *)params_out;
+    snprintf(p->message, sizeof(p->message), "Smart bin online. Ready for use.");
+    p->is_escalation = false;
+}
+
+
+/* ============================================================
+ * TRANSITION CONDITION FUNCTIONS
+ *
+ * CRITICAL: These functions MUST NOT read from the event payload.
+ * They MUST base their decision SOLELY on system_context_t.
+ * ============================================================ */
+
+/* Conditions */
+static bool condition_bin_near_full(const system_context_t *ctx, const system_event_t *event)
+{
+    (void)event;
+    return (ctx->bin_fill_level_percent >= ctx->params.near_full_threshold &&
+            ctx->bin_fill_level_percent < ctx->params.full_threshold);
+}
+static bool condition_bin_full(const system_context_t *ctx, const system_event_t *event)
+{
+    (void)event;
+    return (ctx->bin_fill_level_percent >= ctx->params.full_threshold);
+}
+static bool condition_bin_not_full(const system_context_t *ctx, const system_event_t *event)
+{
+    (void)event;
+    return (ctx->bin_fill_level_percent < ctx->params.empty_threshold);
+}
+static bool condition_bin_not_near_full(const system_context_t *ctx, const system_event_t *event)
+{
+    (void)event;
+    return (ctx->bin_fill_level_percent < ctx->params.near_full_threshold);
+}
+
+
+
+/* ============================================================
+ * STATE TRANSITION TABLE – SINGLE SOURCE OF TRUTH
+ *
+ * EVALUATION RULES:
+ *   1. Rules are evaluated in the order they appear in this table.
+ *   2. The FIRST rule where (current_state, event_id, condition) matches is applied.
+ *   3. No other rules are considered after a match.
+ *   4. If no rule matches, the event is ignored (logged).
+ *
+ * This is intentional and deterministic.
+ * ============================================================ */
+/* ============================================================
+ * MINIMALISTIC TRANSITION TABLE – POSITIVE FLOWS ONLY
+ * ============================================================ */
+static const state_transition_rule_t g_transition_table[] =
+{
+    /* ============================================================
+     * 1. INIT → IDLE (normal boot)
+     * ============================================================ */
+    {
+        .current_state = SYSTEM_STATE_INIT,
+        .event_id      = EVENT_WIFI_CONNECTED,
+        .condition     = NULL,
+        .next_state    = SYSTEM_STATE_IDLE,
+        .command_batch = COMMAND_BATCH(
+            { CMD_START_PIR_MONITORING, NULL },
+            { CMD_SEND_NOTIFICATION, prepare_boot_notification },
+            { CMD_BUZZER_PATTERN, prepare_buzzer_pattern_power_up },
+            { CMD_SHOW_MESSAGE, prepare_welcome_message }
+        )
+    },
+
+    /* ============================================================
+     * 2. IDLE – waiting for user
+     * ============================================================ */
+
+    /* IDLE → ACTIVE (PIR detected) – start guidance timer, no buzzer yet */
+    {
+        .current_state = SYSTEM_STATE_IDLE,
+        .event_id      = EVENT_PERSON_DETECTED,
+        .condition     = NULL,
+        .next_state    = SYSTEM_STATE_ACTIVE,
+        .command_batch = COMMAND_BATCH(
+            { CMD_LED_BLINK, prepare_led_blink_attention },
+            { CMD_SHOW_MESSAGE, prepare_attention_message },
+            { CMD_START_ONESHOT_TIMER_EX, prepare_guidance_timer }   // 10s timer
+        )
+    },
+
+    /* IDLE → ACTIVE (immediate intent – rare, but handle) */
+    {
+        .current_state = SYSTEM_STATE_IDLE,
+        .event_id      = EVENT_CLOSE_RANGE_DETECTED,
+        .condition     = NULL,
+        .next_state    = SYSTEM_STATE_ACTIVE,
+        .command_batch = COMMAND_BATCH(
+            { CMD_OPEN_LID, NULL },
+            { CMD_START_INTENT_TIMER, prepare_intent_timer },   // auto‑close timer
+            { CMD_LED_BLINK_STOP, prepare_led_off_white },
+            { CMD_LED_SET_BRIGHTNESS, prepare_led_on_green },
+            { CMD_BUZZER_PATTERN, prepare_buzzer_pattern_success },
+            { CMD_SHOW_MESSAGE, prepare_processing_message }
+        )
+    },
+
+    /* IDLE → IDLE (near‑full notification – no state change) */
+    {
+        .current_state = SYSTEM_STATE_IDLE,
+        .event_id      = EVENT_FILL_LEVEL_UPDATED,
+        .condition     = condition_bin_near_full,
+        .next_state    = SYSTEM_STATE_IDLE,
+        .command_batch = COMMAND_BATCH(
+            { CMD_SEND_NOTIFICATION, prepare_near_full_notification },
+            { CMD_LED_BLINK, prepare_led_blink_slow },
+            { CMD_BUZZER_BEEP, prepare_buzzer_warning_pulse },
+            { CMD_SHOW_MESSAGE, prepare_near_full_message }
+        )
+    },
+
+    // /* IDLE → FULL (fill jumps directly to full – rare) */
+    // {
+    //     .current_state = SYSTEM_STATE_IDLE,
+    //     .event_id      = EVENT_FILL_LEVEL_UPDATED,
+    //     .condition     = condition_bin_full,
+    //     .next_state    = SYSTEM_STATE_FULL,
+    //     .command_batch = COMMAND_BATCH(
+    //         { CMD_LOCK_BIN, NULL },
+    //         { CMD_SEND_NOTIFICATION, prepare_full_notification },
+    //         { CMD_START_ESCALATION_TIMER, prepare_escalation_timer },
+    //         { CMD_LED_BLINK, prepare_led_blink_fast },
+    //         { CMD_BUZZER_PATTERN, prepare_buzzer_urgent_alarm },
+    //         { CMD_SHOW_MESSAGE, prepare_show_full_message }
+    //     )
+    // },
+
+    /* IDLE → MAINTENANCE (collector authentication before full) */
+    {
+        .current_state = SYSTEM_STATE_IDLE,
+        .event_id      = EVENT_AUTH_GRANTED,
+        .condition     = NULL,
+        .next_state    = SYSTEM_STATE_MAINTENANCE,
+        .command_batch = COMMAND_BATCH(
+            { CMD_UNLOCK_BIN, NULL },
+            { CMD_ENTER_MAINTENANCE_MODE, NULL },
+            { CMD_SEND_SMS_RESPONSE, prepare_auth_success_response },
+            { CMD_LED_SET_BRIGHTNESS, prepare_led_on_blue },
+            { CMD_BUZZER_PATTERN, prepare_buzzer_calming_chord },
+            { CMD_SHOW_MESSAGE, prepare_maintenance_message }
+        )
+    },
+
+    /* ============================================================
+     * 3. ACTIVE – user interaction (lid may be closed or open)
+     * ============================================================ */
+
+    /* ACTIVE → ACTIVE (guidance timer expired – user didn't raise hand) */
+    {
+        .current_state = SYSTEM_STATE_ACTIVE,
+        .event_id      = EVENT_GUIDANCE_TIMEOUT,
+        .condition     = NULL,
+        .next_state    = SYSTEM_STATE_ACTIVE,
+        .command_batch = COMMAND_BATCH(
+            { CMD_BUZZER_PATTERN, prepare_buzzer_pattern_attention },   // friendly chirp
+            { CMD_SHOW_MESSAGE, prepare_attention_message }             // re‑show instruction
+        )
+    },
+
+    /* ACTIVE → ACTIVE (user raises hand – open lid, stop guidance timer, start auto‑close) */
+    {
+        .current_state = SYSTEM_STATE_ACTIVE,
+        .event_id      = EVENT_CLOSE_RANGE_DETECTED,
+        .condition     = NULL,
+        .next_state    = SYSTEM_STATE_ACTIVE,
+        .command_batch = COMMAND_BATCH(
+            { CMD_STOP_ONESHOT_TIMER, NULL },                   // stop guidance timer
+            { CMD_OPEN_LID, NULL },
+            { CMD_START_INTENT_TIMER, prepare_intent_timer },   // auto‑close timer (5s)
+            { CMD_LED_BLINK_STOP, prepare_led_off_white },
+            { CMD_LED_SET_BRIGHTNESS, prepare_led_on_green },
+            { CMD_BUZZER_PATTERN, prepare_buzzer_pattern_success },
+            { CMD_SHOW_MESSAGE, prepare_processing_message }
+        )
+    },
+
+    /* ACTIVE → ACTIVE (near‑full notification – no state change) */
+    {
+        .current_state = SYSTEM_STATE_ACTIVE,
+        .event_id      = EVENT_FILL_LEVEL_UPDATED,
+        .condition     = condition_bin_near_full,
+        .next_state    = SYSTEM_STATE_IDLE,
+        .command_batch = COMMAND_BATCH(
+            { CMD_SEND_NOTIFICATION, prepare_near_full_notification },
+            { CMD_LED_BLINK, prepare_led_blink_slow },
+            { CMD_BUZZER_BEEP, prepare_buzzer_warning_pulse },
+            { CMD_SHOW_MESSAGE, prepare_near_full_message }
+        )
+    },
+
+    /* ACTIVE → FULL (fill reaches full during use) */
+    {
+        .current_state = SYSTEM_STATE_ACTIVE,
+        .event_id      = EVENT_FILL_LEVEL_UPDATED,
+        .condition     = condition_bin_full,
+        .next_state    = SYSTEM_STATE_FULL,
+        .command_batch = COMMAND_BATCH(
+            { CMD_LOCK_BIN, NULL },
+            { CMD_SEND_NOTIFICATION, prepare_full_notification },
+            { CMD_START_ESCALATION_TIMER, prepare_escalation_timer },
+            { CMD_LED_BLINK, prepare_led_blink_fast },
+            { CMD_BUZZER_PATTERN, prepare_buzzer_urgent_alarm },
+            { CMD_SHOW_MESSAGE, prepare_show_full_message }
+        )
+    },
+
+    /* ACTIVE → IDLE (lid closed normally after disposal) */
+    {
+        .current_state = SYSTEM_STATE_ACTIVE,
+        .event_id      = EVENT_LID_CLOSED,
+        .condition     = NULL,
+        .next_state    = SYSTEM_STATE_IDLE,
+        .command_batch = COMMAND_BATCH(
+            { CMD_STOP_INTENT_TIMER, NULL },
+            { CMD_LED_OFF, prepare_led_off_green },
+            { CMD_BUZZER_STOP, prepare_buzzer_gentle_fade },
+            { CMD_SHOW_MESSAGE, prepare_thank_you_message },
+            { CMD_START_ONESHOT_TIMER_EX, prepare_welcome_timer }
+        )
+    },
+
+    /* ACTIVE → IDLE (auto‑close timer expired – user forgot to close) */
+    {
+        .current_state = SYSTEM_STATE_ACTIVE,
+        .event_id      = EVENT_INTENT_TIMEOUT,
+        .condition     = NULL,
+        .next_state    = SYSTEM_STATE_IDLE,
+        .command_batch = COMMAND_BATCH(
+            { CMD_CLOSE_LID, NULL },
+            { CMD_LED_OFF, prepare_led_off_green },
+            { CMD_BUZZER_STOP, prepare_buzzer_gentle_fade_same },
+            { CMD_SHOW_MESSAGE, prepare_welcome_message }
+        )
+    },
+
+    /* ACTIVE → IDLE (person left while lid open – close lid) */
+    {
+        .current_state = SYSTEM_STATE_ACTIVE,
+        .event_id      = EVENT_PERSON_LEFT,
+        .condition     = NULL,
+        .next_state    = SYSTEM_STATE_IDLE,
+        .command_batch = COMMAND_BATCH(
+            { CMD_CLOSE_LID, NULL },
+            { CMD_LED_OFF, prepare_led_off_green },
+            { CMD_BUZZER_STOP, prepare_buzzer_gentle_fade_same },
+            { CMD_SHOW_MESSAGE, prepare_welcome_message }
+        )
+    },
+
+    /* ============================================================
+     * 4. FULL – bin full, locked, escalation active
+     * ============================================================ */
+
+    /* FULL → FULL (person detected – redirect) */
+    {
+        .current_state = SYSTEM_STATE_FULL,
+        .event_id      = EVENT_PERSON_DETECTED,
+        .condition     = NULL,
+        .next_state    = SYSTEM_STATE_FULL,
+        .command_batch = COMMAND_BATCH(
+            { CMD_BIN_NET_FORCE_REDIRECT, NULL }
+        )
+    },
+
+    /* FULL → FULL (close range detected – redirect) */
+    {
+        .current_state = SYSTEM_STATE_FULL,
+        .event_id      = EVENT_CLOSE_RANGE_DETECTED,
+        .condition     = NULL,
+        .next_state    = SYSTEM_STATE_FULL,
+        .command_batch = COMMAND_BATCH(
+            { CMD_BIN_NET_FORCE_REDIRECT, NULL }
+        )
+    },
+
+    /* FULL → IDLE (bin emptied – fill below threshold) */
+    {
+        .current_state = SYSTEM_STATE_FULL,
+        .event_id      = EVENT_FILL_LEVEL_UPDATED,
+        .condition     = condition_bin_not_full,
+        .next_state    = SYSTEM_STATE_IDLE,
+        .command_batch = COMMAND_BATCH(
+            { CMD_UNLOCK_BIN, NULL },
+            { CMD_SEND_NOTIFICATION, prepare_empty_notification },
+            { CMD_STOP_ESCALATION_TIMER, NULL },
+            { CMD_LED_BLINK_STOP, prepare_led_off_red },
+            { CMD_BUZZER_STOP, prepare_buzzer_off },
+            { CMD_SHOW_MESSAGE, prepare_welcome_message }
+        )
+    },
+
+    /* FULL → FULL (escalation timeout – escalate to manager) */
+    {
+        .current_state = SYSTEM_STATE_FULL,
+        .event_id      = EVENT_ESCALATION_TIMEOUT,
+        .condition     = NULL,
+        .next_state    = SYSTEM_STATE_FULL,
+        .command_batch = COMMAND_BATCH(
+            { CMD_ESCALATE_NOTIFICATION, prepare_escalation_message },
+            { CMD_BUZZER_PATTERN, prepare_buzzer_escalating_siren }
+        )
+    },
+
+    /* FULL → FULL (no peer available – show message on LCD) */
+    {
+        .current_state = SYSTEM_STATE_FULL,
+        .event_id      = EVENT_NO_PEER_AVAILABLE,
+        .condition     = NULL,
+        .next_state    = SYSTEM_STATE_FULL,
+        .command_batch = COMMAND_BATCH(
+            { CMD_SHOW_MESSAGE, prepare_no_peer_message }
+        )
+    },
+
+    /* FULL → MAINTENANCE (collector authentication) */
+    {
+        .current_state = SYSTEM_STATE_FULL,
+        .event_id      = EVENT_AUTH_GRANTED,
+        .condition     = NULL,
+        .next_state    = SYSTEM_STATE_MAINTENANCE,
+        .command_batch = COMMAND_BATCH(
+            { CMD_UNLOCK_BIN, NULL },
+            { CMD_ENTER_MAINTENANCE_MODE, NULL },
+            { CMD_SEND_SMS_RESPONSE, prepare_auth_success_response },
+            { CMD_LED_SET_BRIGHTNESS, prepare_led_on_blue },
+            { CMD_BUZZER_PATTERN, prepare_buzzer_calming_chord },
+            { CMD_SHOW_MESSAGE, prepare_maintenance_message }
+        )
+    },
+
+    /* ============================================================
+     * 5. MAINTENANCE – collector servicing
+     * ============================================================ */
+
+    /* MAINTENANCE → IDLE (maintenance completed via SMS) */
+    {
+        .current_state = SYSTEM_STATE_MAINTENANCE,
+        .event_id      = EVENT_MAINTENANCE_COMPLETED,
+        .condition     = NULL,
+        .next_state    = SYSTEM_STATE_IDLE,
+        .command_batch = COMMAND_BATCH(
+            { CMD_EXIT_MAINTENANCE_MODE, NULL },
+            { CMD_LOCK_BIN, NULL },
+            { CMD_LED_OFF, prepare_led_off_blue },
+            { CMD_SHOW_MESSAGE, prepare_welcome_message }
+        )
+    },
+
+    /* MAINTENANCE → MAINTENANCE (ignore close range) */
+    {
+        .current_state = SYSTEM_STATE_MAINTENANCE,
+        .event_id      = EVENT_CLOSE_RANGE_DETECTED,
+        .condition     = NULL,
+        .next_state    = SYSTEM_STATE_MAINTENANCE,
+        .command_batch = COMMAND_BATCH_EMPTY
+    },
+
+    /* ============================================================
+     * 6. ERROR – fault mode (no exit except reset)
+     * ============================================================ */
+
+    /* ANY → ERROR (sensor failure) */
+    {
+        .current_state = SYSTEM_STATE_ANY,
+        .event_id      = EVENT_SENSOR_FAILURE,
+        .condition     = NULL,
+        .next_state    = SYSTEM_STATE_ERROR,
+        .command_batch = COMMAND_BATCH(
+            { CMD_SIGNAL_ERROR, NULL },
+            { CMD_LED_BLINK, prepare_led_blink_fast },
+            { CMD_BUZZER_PATTERN, prepare_buzzer_error_glissando },
+            { CMD_SHOW_MESSAGE, prepare_error_message }
+        )
+    },
+
+    /* ANY → ERROR (system error) */
+    {
+        .current_state = SYSTEM_STATE_ANY,
+        .event_id      = EVENT_SYSTEM_ERROR_DETECTED,
+        .condition     = NULL,
+        .next_state    = SYSTEM_STATE_ERROR,
+        .command_batch = COMMAND_BATCH(
+            { CMD_SIGNAL_ERROR, NULL },
+            { CMD_LED_BLINK, prepare_led_blink_fast },
+            { CMD_BUZZER_PATTERN, prepare_buzzer_error_glissando },
+            { CMD_SHOW_MESSAGE, prepare_error_message }
+        )
+    },
+
+    // /* ERROR self‑transition (stay in ERROR) – catch all */
+    // {
+    //     .current_state = SYSTEM_STATE_ERROR,
+    //     .event_id      = EVENT_ANY,   /* placeholder; actual implementation should list events or use default */
+    //     .condition     = NULL,
+    //     .next_state    = SYSTEM_STATE_ERROR,
+    //     .command_batch = COMMAND_BATCH_EMPTY
+    // },
+
+    /* ============================================================
+     * 7. ANY – fallback for unhandled events (ignore)
+     * ============================================================ */
+    {
+        .current_state = SYSTEM_STATE_ANY,
+        .event_id      = EVENT_AUTH_DENIED,
+        .condition     = NULL,
+        .next_state    = SYSTEM_STATE_ANY,
+        .command_batch = COMMAND_BATCH_EMPTY
+    },
+
+        /* ANY → ANY (network message – already handled by bin_network service) */
+    {
+        .current_state = SYSTEM_STATE_ANY,
+        .event_id      = EVENT_NETWORK_MESSAGE_RECEIVED,
+        .condition     = NULL,
+        .next_state    = SYSTEM_STATE_ANY,
+        .command_batch = COMMAND_BATCH_EMPTY
+    },
+
+    /* ANY → ANY (GPS fix update – services read directly) */
+    {
+        .current_state = SYSTEM_STATE_ANY,
+        .event_id      = EVENT_GPS_FIX_UPDATE,
+        .condition     = NULL,
+        .next_state    = SYSTEM_STATE_ANY,
+        .command_batch = COMMAND_BATCH_EMPTY
+    },
+    /* All other events are ignored (no rule → logged) */
+};
+
+#define TRANSITION_TABLE_SIZE (sizeof(g_transition_table) / sizeof(g_transition_table[0]))
+
+
+/* ============================================================
+ * INTERNAL HELPER: EXECUTE COMMAND BATCH
+ *
+ * - Allocates a stack buffer large enough for any command parameters.
+ * - For each command, if a preparer exists, calls it to fill the buffer.
+ * - Passes the buffer pointer (or NULL) to command_router_execute().
+ * - Does NOT modify context or state.
+ * ============================================================ */
+static void execute_command_batch(const command_batch_t *batch, const system_event_t *event)
+{
+    command_param_union_t param_buffer;
+
+    for (uint8_t i = 0; i < batch->count; i++) {
+        const transition_command_t *tc = &batch->commands[i];
+        void *params = NULL;
+
+        if (tc->prepare_params != NULL) {
+            memset(&param_buffer, 0, sizeof(param_buffer));
+            tc->prepare_params(&g_context, event, &param_buffer);
+            params = &param_buffer;
+        }
+
+        esp_err_t ret = command_router_execute(tc->cmd, params);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "Command %d returned %d", tc->cmd, ret);
+        }
+    }
+}
+
+/* ============================================================
+ * PUBLIC API IMPLEMENTATION
+ * ============================================================ */
+
+esp_err_t state_manager_init(const system_context_t *initial_context)
+{
+    if (initial_context == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    system_state_init();
+    memcpy(&g_context, initial_context, sizeof(system_context_t));
+
+    esp_err_t mutex_ret = context_lock_init();
+    if (mutex_ret != ESP_OK) {
+        return mutex_ret;  // cannot continue without mutex
+    }
+
+    ESP_LOGI(TAG, "State manager initialized. Current state: %s",
+             system_state_to_string(system_state_get()));
+    return ESP_OK;
+}
+
+esp_err_t state_manager_process_event(const system_event_t *event)
+{
+    if (event == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /* --------------------------------------------------------
+     * 1. UPDATE CONTEXT – absorb observed facts
+     * -------------------------------------------------------- */
+    switch (event->id) {
+        case EVENT_FILL_LEVEL_UPDATED:
+            g_context.bin_fill_level_percent = event->data.fill_level.fill_percent;
+            cmd_bin_net_level_update_t lvl = {
+                .fill_level_percent = event->data.fill_level.fill_percent
+            };
+            command_router_execute(CMD_BIN_NET_NOTIFY_LEVEL_UPDATE, &lvl);
+            break;
+        case EVENT_AUTH_GRANTED:
+            g_context.auth_status = AUTH_STATUS_GRANTED;
+            break;
+        case EVENT_AUTH_DENIED:
+            g_context.auth_status = AUTH_STATUS_DENIED;
+            break;
+        case EVENT_LID_CLOSED:
+            g_context.pending_welcome = true;
+            break;
+        case EVENT_GPS_FIX_UPDATE:
+            if (s_context_mutex == NULL) break;
+            if (event->data.gps_fix.valid) {
+                xSemaphoreTake(s_context_mutex, portMAX_DELAY);
+                g_context.gps_coordinates.latitude  = event->data.gps_fix.latitude;
+                g_context.gps_coordinates.longitude = event->data.gps_fix.longitude;
+                g_context.gps_coordinates.altitude  = event->data.gps_fix.altitude_m;
+                g_context.gps_coordinates.fix_quality =
+                    (uint8_t)(event->data.gps_fix.satellites > 0 ? 1 : 0);
+                g_context.gps_valid = true;
+                xSemaphoreGive(s_context_mutex);
+            }
+            break;
+
+        case EVENT_GPS_FIX_LOST:
+            {
+                if (s_context_mutex == NULL) break;
+                xSemaphoreTake(s_context_mutex, portMAX_DELAY);
+                g_context.gps_valid = false;
+                xSemaphoreGive(s_context_mutex);
+            }
+            break;
+        case EVENT_MQTT_CONNECTED:
+            command_router_execute(CMD_BIN_NET_NOTIFY_MQTT_CONNECTED, NULL);
+            break;
+
+        case EVENT_NETWORK_MESSAGE_RECEIVED:
+            cmd_bin_net_network_msg_t msg;
+            strlcpy(msg.topic, event->data.mqtt_message.topic, sizeof(msg.topic));
+            memcpy(msg.payload, event->data.mqtt_message.payload, event->data.mqtt_message.payload_len);
+            msg.payload_len = event->data.mqtt_message.payload_len;
+            command_router_execute(CMD_BIN_NET_NOTIFY_NETWORK_MESSAGE, &msg);
+            break;
+        /* EVENT_NEIGHBOR_STATUS_RECEIVED: core does not store neighbor data */
+        default:
+            break;
+    }
+
+    /* --------------------------------------------------------
+     * Forward web command messages to the web command service
+     * -------------------------------------------------------- */
+    if (event->id == EVENT_NETWORK_MESSAGE_RECEIVED) {
+        /**< For debugging: logging relevant event data when msg is recieved */
+        ESP_LOGI(TAG, "MQTT received: \n\t topic=%.*s, \n\t payload=%.*s",
+                (int)strlen(event->data.mqtt_message.topic), event->data.mqtt_message.topic,
+                (int)event->data.mqtt_message.payload_len, event->data.mqtt_message.payload);
+
+        // web_command_params_t params;
+        // strlcpy(params.topic, event->data.mqtt_message.topic, sizeof(params.topic));
+        // size_t copy_len = event->data.mqtt_message.payload_len;
+        // if (copy_len > sizeof(params.payload)) copy_len = sizeof(params.payload);
+        // memcpy(params.payload, event->data.mqtt_message.payload, copy_len);
+        // params.payload_len = copy_len;
+        // command_router_execute(CMD_PROCESS_WEB_COMMAND, &params);
+    }
+
+    // /**< For debugging: logging GPS fix updates */
+    // if (event->id == EVENT_GPS_FIX_UPDATED) {
+    //     ESP_LOGI(TAG, "GPS fix: lat=%.6f, lon=%.6f, alt=%.1f, sats=%u, hdop=%.1f",
+    //             event->data.gps_fix.latitude,
+    //             event->data.gps_fix.longitude,
+    //             event->data.gps_fix.altitude_m,
+    //             event->data.gps_fix.satellites,
+    //             event->data.gps_fix.hdop);
+    // } else if (event->id == EVENT_GPS_FIX_LOST) {
+    //     ESP_LOGI(TAG, "GPS fix lost");
+    // }
+
+    /* --------------------------------------------------------
+     * 2. EVALUATE TRANSITION TABLE – first match wins
+     * -------------------------------------------------------- */
+    system_state_t current_state = system_state_get();
+
+    for (size_t i = 0; i < TRANSITION_TABLE_SIZE; i++) {
+        const state_transition_rule_t *rule = &g_transition_table[i];
+
+        if (rule->current_state != current_state) continue;
+        if (rule->event_id != event->id) continue;
+        if (rule->condition != NULL && !rule->condition(&g_context, event)) continue;
+
+        ESP_LOGI(TAG, "Transition: %s -> %s (event %d)",
+                 system_state_to_string(current_state),
+                 system_state_to_string(rule->next_state),
+                 event->id);
+
+        system_state_set(rule->next_state);
+        execute_command_batch(&rule->command_batch, event);
+        return ESP_OK;
+    }
+
+    ESP_LOGW(TAG, "No transition for event %d in state %s",
+             event->id, system_state_to_string(current_state));
+    return ESP_OK;
+}
+
+const system_context_t* state_manager_get_context(void)
+{
+    return &g_context;
+}
+
+
+static esp_err_t context_lock_init(void)
+{
+    if (s_context_mutex != NULL) {
+        return ESP_OK; /* already created */
+    }
+    s_context_mutex = xSemaphoreCreateMutex();
+    if (s_context_mutex == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
+void state_manager_copy_context(system_context_t *dest) {
+    if (dest == NULL) return;
+    if (s_context_mutex == NULL) return;   /* not yet initialised */
+    xSemaphoreTake(s_context_mutex, portMAX_DELAY);
+    memcpy(dest, &g_context, sizeof(system_context_t));
+    xSemaphoreGive(s_context_mutex);
+}
