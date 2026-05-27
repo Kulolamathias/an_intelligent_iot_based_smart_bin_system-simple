@@ -12,6 +12,7 @@ idf_component_register(
         common_utils
         # tests
         esp_event
+        esp_timer
         efuse
         drivers
 )

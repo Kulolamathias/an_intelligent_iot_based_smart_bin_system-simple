@@ -6,6 +6,7 @@
 #include "esp_log.h"
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
+#include "esp_timer.h"
 #include "esp_efuse.h"
 #include "esp_mac.h"
 #include "ultrasonic_driver.h"
@@ -65,6 +66,16 @@ static const char *TAG = "SMART_BIN";
 #define COLLECTOR_PHONE    "+255688173415"
 #define GSM_PASSWORD       "SECRET123"
 
+/* Fill level calculation – configurable thresholds (all in cm) */
+#define DISTANCE_0_PERCENT_CM      60.0f   /* sensor reading (cm) when bin is EMPTY (0% full) */
+#define DISTANCE_100_PERCENT_CM    5.0f    /* sensor reading (cm) when bin is FULL (100% full) */
+#define MAX_VALID_DISTANCE_CM      200.0f  /* ignore readings beyond this (sensor max range) */
+
+/* Fill level stability */
+#define FILL_MIN_UPDATE_INTERVAL_MS   700   // minimum time between updates (1 second)
+#define FILL_DEADBAND_PERCENT         5      // ignore changes smaller than ±5%
+#define FILL_MEDIAN_WINDOW_SIZE       7      // number of samples for median filter
+
 /* Peer registry */
 #define MAX_PEERS 16
 typedef struct {
@@ -96,6 +107,9 @@ static peer_t s_peers[MAX_PEERS] = {0};
 static bool s_wifi_connected = false;
 static bool s_mqtt_connected = false;
 static bool s_redirect_pending = false;   // set when bin becomes full
+
+static uint8_t s_stable_fill = 0;          // filtered, debounced fill level
+static uint64_t s_last_fill_update_us = 0; // timestamp of last update
 
 static uint8_t s_current_fill = 0;
 static uint8_t s_last_sent_fill = 0xFF;
@@ -160,23 +174,46 @@ static bool is_hand_detected(void) {
     return false;
 }
 
-static uint8_t get_fill_percent(void) {
+static uint8_t get_fill_percent(void)
+{
     if (!s_fill_sensor) return 0;
-    uint32_t samples[5];
+
+    uint32_t samples[FILL_MEDIAN_WINDOW_SIZE];
     int valid = 0;
-    for (int i = 0; i < 5; i++) {
+
+    for (int i = 0; i < FILL_MEDIAN_WINDOW_SIZE; i++) {
         uint32_t pulse_us;
         if (ultrasonic_driver_measure(s_fill_sensor, &pulse_us) == ESP_OK) {
-            uint32_t dist = (pulse_us * 1715) / 100000;
-            if (dist >= 2 && dist <= 400) samples[valid++] = dist;
+            float dist = (pulse_us * 1715.0f) / 100000.0f;
+            if (dist >= 2.0f && dist <= MAX_VALID_DISTANCE_CM) {
+                samples[valid++] = (uint32_t)(dist * 10);  // store in 0.1 cm resolution
+            }
         }
         vTaskDelay(pdMS_TO_TICKS(10));
     }
-    if (valid == 0) return 0;
-    uint32_t filtered = median_filter_5(samples);
-    if (filtered >= 55) return 0;
-    if (filtered <= 2) return 100;
-    return (uint8_t)(((55 - filtered) * 100) / 55);
+
+    if (valid < (FILL_MEDIAN_WINDOW_SIZE / 2 + 1)) return 0;
+
+    // Bubble sort for small window
+    for (int i = 0; i < valid - 1; i++) {
+        for (int j = i + 1; j < valid; j++) {
+            if (samples[i] > samples[j]) {
+                uint32_t t = samples[i]; samples[i] = samples[j]; samples[j] = t;
+            }
+        }
+    }
+
+    float median_cm = (float)samples[valid / 2] / 10.0f;
+
+    // Clamp to defined thresholds
+    if (median_cm <= DISTANCE_100_PERCENT_CM) return 100;
+    if (median_cm >= DISTANCE_0_PERCENT_CM)   return 0;
+
+    // Linear interpolation between empty and full
+    float percent = 100.0f * (DISTANCE_0_PERCENT_CM - median_cm) / (DISTANCE_0_PERCENT_CM - DISTANCE_100_PERCENT_CM);
+    if (percent < 0)   percent = 0;
+    if (percent > 100) percent = 100;
+    return (uint8_t)(percent + 0.5f);
 }
 
 /* ========== Buzzer Patterns ========== */
@@ -217,13 +254,19 @@ static void update_lcd_main(const char *line1, const char *line2) {
     }
 }
 
-static void update_lcd_gps_fill(void) {
+static void update_lcd_gps_fill(void)
+{
     static char line3[21] = "", line4[21] = "";
+    static uint64_t last_update_us = 0;
+    uint64_t now_us = esp_timer_get_time();
+
+    if ((now_us - last_update_us) < 200000) return; // 200 ms minimum
+
     char new3[21], new4[21];
     snprintf(new3, sizeof(new3), "Fill: %3d%%", s_current_fill);
     if (s_gps_valid) {
         double lat, lon;
-        if (xSemaphoreTake(s_gps_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        if (xSemaphoreTake(s_gps_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
             lat = s_last_gps.latitude;
             lon = s_last_gps.longitude;
             xSemaphoreGive(s_gps_mutex);
@@ -234,12 +277,13 @@ static void update_lcd_gps_fill(void) {
     }
     if (strcmp(line3, new3) != 0) {
         lcd_driver_write_string(s_lcd, 2, 0, new3);
-        vTaskDelay(pdMS_TO_TICKS(5));
         strcpy(line3, new3);
+        last_update_us = now_us;
     }
     if (strcmp(line4, new4) != 0) {
         lcd_driver_write_string(s_lcd, 3, 0, new4);
         strcpy(line4, new4);
+        last_update_us = now_us;
     }
 }
 
@@ -647,11 +691,23 @@ static void control_task(void *pvParameters) {
         uint32_t now = get_time_ms();
         pir_driver_read(s_pir, &pir_detected);
         bool hand = is_hand_detected();
-        uint8_t fill = get_fill_percent();
-        s_current_fill = fill;
+
+        // Stable fill level update with debounce
+        uint8_t raw_fill = get_fill_percent();
+        uint64_t now_us = esp_timer_get_time();
+        if (abs((int)raw_fill - (int)s_stable_fill) >= FILL_DEADBAND_PERCENT ||
+            (now_us - s_last_fill_update_us) >= (FILL_MIN_UPDATE_INTERVAL_MS * 1000ULL)) {
+            s_stable_fill = raw_fill;
+            s_last_fill_update_us = now_us;
+            s_current_fill = s_stable_fill;
+            ESP_LOGD(TAG, "Fill level updated: %d%%", s_current_fill);
+        } else {
+            // No significant change, keep previous stable value
+            // s_current_fill remains unchanged
+        }
 
         // Request redirect when bin becomes full (and not already in maintenance)
-        if (fill >= 100 && s_state != STATE_MAINTENANCE && !s_redirect_pending) {
+        if (s_current_fill >= 100 && s_state != STATE_MAINTENANCE && !s_redirect_pending) {
             s_redirect_pending = true;
         }
 
