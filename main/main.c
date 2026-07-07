@@ -1,9 +1,13 @@
 #include <stdio.h>
 #include <string.h>
+#include <ctype.h>
+#include <stdlib.h>
+#include <stdint.h>
 #include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_err.h"
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "esp_timer.h"
@@ -64,7 +68,15 @@ static const char *TAG = "SMART_BIN";
 #define FULL_PERCENT       100
 #define DEBOUNCE_SEC       300
 #define COLLECTOR_PHONE    "+255688173415"
+#define MANAGER_PHONE      COLLECTOR_PHONE
 #define GSM_PASSWORD       "SECRET123"
+#define GSM_INIT_RETRY_INTERVAL_MS  30000
+#define GSM_SMS_RETRY_INTERVAL_SEC  60
+#define GSM_POLL_INTERVAL_MS        5000
+#define GSM_SEND_TIMEOUT_MS         45000
+#define GSM_SEND_ATTEMPTS           2
+#define GSM_REINIT_AFTER_FAILURES   3
+#define GSM_ESCALATION_DELAY_SEC    3600
 
 /* Fill level calculation – configurable thresholds (all in cm) */
 #define DISTANCE_0_PERCENT_CM      60.0f   /* sensor reading (cm) when bin is EMPTY (0% full) */
@@ -112,8 +124,12 @@ static uint8_t s_stable_fill = 0;          // filtered, debounced fill level
 static uint64_t s_last_fill_update_us = 0; // timestamp of last update
 
 static uint8_t s_current_fill = 0;
-static uint8_t s_last_sent_fill = 0xFF;
-static uint32_t s_last_sms_time = 0;
+
+typedef struct {
+    bool sent;
+    uint32_t last_attempt_s;
+    uint8_t failure_count;
+} gsm_alert_state_t;
 
 /* ========== State Machine ========== */
 typedef enum {
@@ -319,6 +335,7 @@ static void gps_task(void *pvParameters) {
     }
 }
 
+#if 0
 /* ========== GSM Task (with retry and boot SMS) ========== */
 static void gsm_task(void *pvParameters)
 {
@@ -404,6 +421,304 @@ static void on_sms_received(const received_sms_t *sms) {
         led_driver_on(s_led_green);
         servo_driver_set_angle(s_servo, 90.0f);
         ESP_LOGI(TAG, "Maintenance mode activated");
+    }
+}
+#endif
+
+/* ========== GSM Task (fail-soft deterministic manager) ========== */
+static void gsm_alert_reset(gsm_alert_state_t *alert)
+{
+    if (alert) {
+        memset(alert, 0, sizeof(*alert));
+    }
+}
+
+static bool gsm_alert_due(const gsm_alert_state_t *alert, uint32_t now_s)
+{
+    if (!alert || alert->sent) {
+        return false;
+    }
+    return alert->last_attempt_s == 0 ||
+           (now_s - alert->last_attempt_s) >= GSM_SMS_RETRY_INTERVAL_SEC;
+}
+
+static bool sms_contains_ci(const char *message, const char *needle)
+{
+    if (!message || !needle || *needle == '\0') {
+        return false;
+    }
+
+    size_t needle_len = strlen(needle);
+    for (const char *p = message; *p; p++) {
+        size_t i = 0;
+        while (i < needle_len &&
+               p[i] &&
+               (char)toupper((unsigned char)p[i]) ==
+               (char)toupper((unsigned char)needle[i])) {
+            i++;
+        }
+        if (i == needle_len) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void normalize_phone_number(const char *src, char *dst, size_t dst_size)
+{
+    if (!src || !dst || dst_size == 0) {
+        return;
+    }
+
+    size_t j = 0;
+    for (size_t i = 0; src[i] && j < dst_size - 1; i++) {
+        if (isdigit((unsigned char)src[i])) {
+            dst[j++] = src[i];
+        }
+    }
+    dst[j] = '\0';
+}
+
+static bool phone_digits_match(const char *a, const char *b)
+{
+    size_t len_a = strlen(a);
+    size_t len_b = strlen(b);
+    size_t min_len = len_a < len_b ? len_a : len_b;
+
+    if (len_a == 0 || len_b == 0) {
+        return false;
+    }
+    if (strcmp(a, b) == 0) {
+        return true;
+    }
+    if (min_len < 9) {
+        return false;
+    }
+
+    return strcmp(a + len_a - min_len, b + len_b - min_len) == 0;
+}
+
+static bool sms_sender_authorized(const char *sender)
+{
+    char sender_clean[20] = {0};
+    char collector_clean[20] = {0};
+    normalize_phone_number(sender, sender_clean, sizeof(sender_clean));
+    normalize_phone_number(COLLECTOR_PHONE, collector_clean, sizeof(collector_clean));
+
+    return phone_digits_match(sender_clean, collector_clean);
+}
+
+static bool gsm_start_once(void)
+{
+    gsm_config_t cfg = {
+        .uart_port = UART_NUM_2,
+        .tx_pin = GPIO_NUM_17,
+        .rx_pin = GPIO_NUM_16,
+        .baud_rate = 9600,
+        .buf_size = 2048,
+        .timeout_ms = GSM_SEND_TIMEOUT_MS,
+        .retry_count = 2,
+    };
+
+    esp_err_t ret = gsm_init(&cfg);
+    if (ret != ESP_OK || !gsm_is_ready()) {
+        ESP_LOGW(TAG, "GSM unavailable (%s); bin continues without SMS",
+                 esp_err_to_name(ret));
+        gsm_deinit();
+        return false;
+    }
+
+    static const char *auth[] = { COLLECTOR_PHONE };
+    gsm_set_authorized_numbers(auth, 1);
+    gsm_set_password(GSM_PASSWORD);
+    gsm_set_received_callback(on_sms_received);
+    ESP_LOGI(TAG, "GSM ready");
+    return true;
+}
+
+static esp_err_t gsm_send_confirmed(const char *label, const char *phone, const char *message)
+{
+    esp_err_t ret = ESP_ERR_INVALID_STATE;
+
+    for (int attempt = 1; attempt <= GSM_SEND_ATTEMPTS; attempt++) {
+        if (!gsm_is_ready()) {
+            return ESP_ERR_INVALID_STATE;
+        }
+
+        ESP_LOGI(TAG, "GSM send %s attempt %d/%d", label, attempt, GSM_SEND_ATTEMPTS);
+        ret = gsm_send_sms(phone, message, GSM_SEND_TIMEOUT_MS);
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "GSM send %s confirmed", label);
+            return ESP_OK;
+        }
+
+        ESP_LOGW(TAG, "GSM send %s failed: %s", label, esp_err_to_name(ret));
+        gsm_reset();
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+
+    return ret;
+}
+
+static bool gsm_try_alert(gsm_alert_state_t *alert,
+                          uint32_t now_s,
+                          const char *label,
+                          const char *phone,
+                          const char *message)
+{
+    if (!gsm_alert_due(alert, now_s)) {
+        return true;
+    }
+
+    alert->last_attempt_s = now_s;
+    esp_err_t ret = gsm_send_confirmed(label, phone, message);
+    if (ret == ESP_OK) {
+        alert->sent = true;
+        alert->failure_count = 0;
+        return true;
+    }
+
+    if (alert->failure_count < UINT8_MAX) {
+        alert->failure_count++;
+    }
+    return false;
+}
+
+static void gsm_task(void *pvParameters)
+{
+    vTaskDelay(pdMS_TO_TICKS(5000));
+
+    bool gsm_ok = false;
+    uint32_t last_init_attempt_ms = 0;
+    uint32_t last_sms_poll_ms = 0;
+    uint8_t consecutive_gsm_failures = 0;
+    bool full_episode_active = false;
+    uint32_t full_episode_started_s = 0;
+
+    gsm_alert_state_t boot_alert = {0};
+    gsm_alert_state_t near_alert = {0};
+    gsm_alert_state_t full_alert = {0};
+    gsm_alert_state_t escalation_alert = {0};
+
+    while (1) {
+        uint32_t now_ms = get_time_ms();
+        uint32_t now_s = now_ms / 1000;
+
+        if (!gsm_ok) {
+            if (last_init_attempt_ms == 0 ||
+                (now_ms - last_init_attempt_ms) >= GSM_INIT_RETRY_INTERVAL_MS) {
+                last_init_attempt_ms = now_ms;
+                gsm_ok = gsm_start_once();
+            }
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+
+        if (!gsm_is_ready()) {
+            ESP_LOGW(TAG, "GSM lost readiness; reinitialising later");
+            gsm_deinit();
+            gsm_ok = false;
+            consecutive_gsm_failures = 0;
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+
+        if (!boot_alert.sent) {
+            if (!gsm_try_alert(&boot_alert, now_s, "boot", COLLECTOR_PHONE,
+                               "Smart bin online. Ready for use.")) {
+                consecutive_gsm_failures++;
+            } else {
+                consecutive_gsm_failures = 0;
+            }
+        }
+
+        if ((now_ms - last_sms_poll_ms) >= GSM_POLL_INTERVAL_MS) {
+            esp_err_t ret = gsm_check_sms(true);
+            if (ret == ESP_ERR_TIMEOUT || ret == ESP_ERR_INVALID_STATE) {
+                consecutive_gsm_failures++;
+                ESP_LOGW(TAG, "GSM SMS poll failed: %s", esp_err_to_name(ret));
+            } else {
+                consecutive_gsm_failures = 0;
+            }
+            gsm_process_received_sms();
+            last_sms_poll_ms = now_ms;
+        }
+
+        uint8_t fill = s_current_fill;
+        if (fill < NEAR_FULL_PERCENT) {
+            gsm_alert_reset(&near_alert);
+            gsm_alert_reset(&full_alert);
+            gsm_alert_reset(&escalation_alert);
+            full_episode_active = false;
+            full_episode_started_s = 0;
+        } else if (fill >= FULL_PERCENT) {
+            if (!full_episode_active) {
+                full_episode_active = true;
+                full_episode_started_s = now_s;
+                gsm_alert_reset(&full_alert);
+                gsm_alert_reset(&escalation_alert);
+            }
+
+            char msg[96];
+            snprintf(msg, sizeof(msg), "Bin FULL at %d%%. Send password to unlock.", fill);
+            if (!gsm_try_alert(&full_alert, now_s, "full", COLLECTOR_PHONE, msg)) {
+                consecutive_gsm_failures++;
+            }
+
+            if ((now_s - full_episode_started_s) >= GSM_ESCALATION_DELAY_SEC) {
+                if (!gsm_try_alert(&escalation_alert, now_s, "escalation", MANAGER_PHONE,
+                                   "URGENT: Bin full for >1 hour. Collector unresponsive.")) {
+                    consecutive_gsm_failures++;
+                }
+            }
+        } else {
+            full_episode_active = false;
+            gsm_alert_reset(&full_alert);
+            gsm_alert_reset(&escalation_alert);
+
+            char msg[96];
+            snprintf(msg, sizeof(msg), "Bin near-full (%d%%). Will lock when full.", fill);
+            if (!gsm_try_alert(&near_alert, now_s, "near-full", COLLECTOR_PHONE, msg)) {
+                consecutive_gsm_failures++;
+            }
+        }
+
+        if (consecutive_gsm_failures >= GSM_REINIT_AFTER_FAILURES) {
+            ESP_LOGW(TAG, "GSM had %d consecutive failures; reinitialising",
+                     consecutive_gsm_failures);
+            gsm_deinit();
+            gsm_ok = false;
+            consecutive_gsm_failures = 0;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(250));
+    }
+}
+
+static void on_sms_received(const received_sms_t *sms) {
+    if (!sms || !sms_sender_authorized(sms->sender)) {
+        return;
+    }
+
+    if (!sms_contains_ci(sms->message, GSM_PASSWORD)) {
+        return;
+    }
+
+    if (sms_contains_ci(sms->message, "UNLOCK")) {
+        s_state = STATE_MAINTENANCE;
+        update_lcd_main("Maintenance", "Unlocked");
+        led_driver_on(s_led_green);
+        servo_driver_set_angle(s_servo, 90.0f);
+        gsm_send_confirmed("unlock-ack", sms->sender, "Bin unlocked for maintenance.");
+        ESP_LOGI(TAG, "Maintenance mode activated");
+    } else if (sms_contains_ci(sms->message, "MAINTENANCE DONE") ||
+               sms_contains_ci(sms->message, "LOCK")) {
+        servo_driver_set_angle(s_servo, 0.0f);
+        s_state = STATE_IDLE;
+        update_leds(s_state);
+        update_lcd_main("Welcome", "");
+        gsm_send_confirmed("maintenance-done-ack", sms->sender, "Maintenance completed. Bin locked.");
+        ESP_LOGI(TAG, "Maintenance mode completed");
     }
 }
 

@@ -20,6 +20,7 @@ typedef struct {
     QueueHandle_t received_queue;
     TaskHandle_t async_task;
     SemaphoreHandle_t mutex;
+    bool uart_driver_installed;
     bool initialized;
     bool module_ready;
     char password[33];
@@ -55,6 +56,7 @@ static bool is_authorized_number(const char *phone_number);
 static void cleanup_phone_number(char *phone_number);
 static esp_err_t read_and_process_sms(uint8_t index, bool delete_after);
 static esp_err_t parse_sms_message(const char *response, received_sms_t *sms);
+static void gsm_cleanup_context(void);
 
 /**
  * @brief Parse SMS message from AT+CMGR response
@@ -276,8 +278,12 @@ static esp_err_t send_at_command(const char *cmd, const char *expected, uint32_t
  */
 esp_err_t gsm_init(const gsm_config_t *config) {
     if (g_gsm_ctx.initialized) {
-        ESP_LOGW(TAG, "Already initialized");
-        return ESP_OK;
+        if (g_gsm_ctx.module_ready) {
+            ESP_LOGW(TAG, "Already initialized");
+            return ESP_OK;
+        }
+        ESP_LOGW(TAG, "Previous init was incomplete, cleaning up");
+        gsm_cleanup_context();
     }
     
     // Use default config if none provided
@@ -296,6 +302,10 @@ esp_err_t gsm_init(const gsm_config_t *config) {
     // Create SMS queues
     g_gsm_ctx.sms_queue = xQueueCreate(5, sizeof(sms_message_t));
     g_gsm_ctx.received_queue = xQueueCreate(10, sizeof(received_sms_t));
+    if (g_gsm_ctx.sms_queue == NULL || g_gsm_ctx.received_queue == NULL) {
+        gsm_cleanup_context();
+        return ESP_ERR_NO_MEM;
+    }
     
     // Initialize other fields
     memset(g_gsm_ctx.password, 0, sizeof(g_gsm_ctx.password));
@@ -315,16 +325,34 @@ esp_err_t gsm_init(const gsm_config_t *config) {
         .source_clk = UART_SCLK_APB,
     };
     
-    ESP_ERROR_CHECK(uart_driver_install(g_gsm_ctx.config.uart_port, 
-                                       g_gsm_ctx.config.buf_size, 
-                                       g_gsm_ctx.config.buf_size, 
-                                       0, NULL, 0));
-    ESP_ERROR_CHECK(uart_param_config(g_gsm_ctx.config.uart_port, &uart_config));
-    ESP_ERROR_CHECK(uart_set_pin(g_gsm_ctx.config.uart_port, 
-                                g_gsm_ctx.config.tx_pin, 
-                                g_gsm_ctx.config.rx_pin, 
-                                UART_PIN_NO_CHANGE, 
-                                UART_PIN_NO_CHANGE));
+    esp_err_t ret = uart_driver_install(g_gsm_ctx.config.uart_port,
+                                        g_gsm_ctx.config.buf_size,
+                                        g_gsm_ctx.config.buf_size,
+                                        0, NULL, 0);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "UART driver install failed: %s", esp_err_to_name(ret));
+        gsm_cleanup_context();
+        return ret;
+    }
+    g_gsm_ctx.uart_driver_installed = true;
+
+    ret = uart_param_config(g_gsm_ctx.config.uart_port, &uart_config);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "UART config failed: %s", esp_err_to_name(ret));
+        gsm_cleanup_context();
+        return ret;
+    }
+
+    ret = uart_set_pin(g_gsm_ctx.config.uart_port,
+                       g_gsm_ctx.config.tx_pin,
+                       g_gsm_ctx.config.rx_pin,
+                       UART_PIN_NO_CHANGE,
+                       UART_PIN_NO_CHANGE);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "UART pin config failed: %s", esp_err_to_name(ret));
+        gsm_cleanup_context();
+        return ret;
+    }
     
     // Set initial status
     g_gsm_ctx.status = GSM_STATUS_INITIALIZING;
@@ -339,22 +367,57 @@ esp_err_t gsm_init(const gsm_config_t *config) {
     clear_uart_buffer();
     
     // Test communication
-    esp_err_t ret = send_at_command("AT", "OK", 5000, true);
+    ret = send_at_command("AT", "OK", 5000, true);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Module not responding");
-        return ESP_FAIL;
+        gsm_cleanup_context();
+        return ret;
     }
     
     // Configure module
-    send_at_command("ATE0", "OK", 3000, true);      // Echo off
-    send_at_command("AT+CMGF=1", "OK", 3000, true); // Text mode
-    
-    // Configure SMS reception
-    // CNMI=2,1 - Show new SMS directly with content
-    send_at_command("AT+CNMI=2,1,0,0,0", "OK", 3000, true);
+    ret = send_at_command("ATE0", "OK", 3000, true);      // Echo off
+    if (ret != ESP_OK) {
+        gsm_cleanup_context();
+        return ret;
+    }
+
+    ret = send_at_command("AT+CPIN?", "READY", 5000, true);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "SIM is not ready");
+        gsm_cleanup_context();
+        return ret;
+    }
+
+    ret = send_at_command("AT+CREG?", "OK", 5000, true);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Network registration query failed");
+        gsm_cleanup_context();
+        return ret;
+    }
+
+    ret = send_at_command("AT+CSQ", "OK", 3000, true);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Signal quality query failed");
+    }
+
+    ret = send_at_command("AT+CMGF=1", "OK", 3000, true); // Text mode
+    if (ret != ESP_OK) {
+        gsm_cleanup_context();
+        return ret;
+    }
+
+    // CNMI=2,1 stores incoming SMS and reports its index via +CMTI.
+    ret = send_at_command("AT+CNMI=2,1,0,0,0", "OK", 3000, true);
+    if (ret != ESP_OK) {
+        gsm_cleanup_context();
+        return ret;
+    }
     
     // Delete all old SMS
-    send_at_command("AT+CMGDA=\"DEL ALL\"", "OK", 5000, true);
+    ret = send_at_command("AT+CMGDA=\"DEL ALL\"", "OK", 5000, true);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Could not clear old SMS during init");
+    }
     
     ESP_LOGI(TAG, "Module ready");
     
@@ -362,8 +425,53 @@ esp_err_t gsm_init(const gsm_config_t *config) {
     g_gsm_ctx.module_ready = true;
     
     // Create async task for sending
-    xTaskCreate(async_sms_task, "gsm_async", 4096, NULL, 5, &g_gsm_ctx.async_task);
+    BaseType_t task_ret = xTaskCreate(async_sms_task, "gsm_async", 4096, NULL, 5, &g_gsm_ctx.async_task);
+    if (task_ret != pdPASS) {
+        ESP_LOGE(TAG, "Failed to start GSM async task");
+        gsm_cleanup_context();
+        return ESP_ERR_NO_MEM;
+    }
     
+    return ESP_OK;
+}
+
+static void gsm_cleanup_context(void) {
+    if (g_gsm_ctx.async_task != NULL) {
+        vTaskDelete(g_gsm_ctx.async_task);
+        g_gsm_ctx.async_task = NULL;
+    }
+
+    if (g_gsm_ctx.uart_driver_installed) {
+        uart_driver_delete(g_gsm_ctx.config.uart_port);
+        g_gsm_ctx.uart_driver_installed = false;
+    }
+
+    if (g_gsm_ctx.sms_queue != NULL) {
+        vQueueDelete(g_gsm_ctx.sms_queue);
+        g_gsm_ctx.sms_queue = NULL;
+    }
+
+    if (g_gsm_ctx.received_queue != NULL) {
+        vQueueDelete(g_gsm_ctx.received_queue);
+        g_gsm_ctx.received_queue = NULL;
+    }
+
+    if (g_gsm_ctx.mutex != NULL) {
+        vSemaphoreDelete(g_gsm_ctx.mutex);
+        g_gsm_ctx.mutex = NULL;
+    }
+
+    memset(g_response_buffer, 0, sizeof(g_response_buffer));
+    memset(&g_gsm_ctx, 0, sizeof(g_gsm_ctx));
+    g_gsm_ctx.status = GSM_STATUS_IDLE;
+}
+
+esp_err_t gsm_deinit(void) {
+    if (!g_gsm_ctx.initialized && !g_gsm_ctx.uart_driver_installed) {
+        return ESP_OK;
+    }
+
+    gsm_cleanup_context();
     return ESP_OK;
 }
 
@@ -371,8 +479,8 @@ esp_err_t gsm_init(const gsm_config_t *config) {
  * @brief Internal SMS sending function
  */
 static esp_err_t internal_send_sms(const char *phone_number, const char *message, uint32_t timeout) {
-    if (!g_gsm_ctx.initialized) {
-        return ESP_FAIL;
+    if (!g_gsm_ctx.initialized || !g_gsm_ctx.module_ready) {
+        return ESP_ERR_INVALID_STATE;
     }
     
     // Take mutex to ensure exclusive access
@@ -382,6 +490,7 @@ static esp_err_t internal_send_sms(const char *phone_number, const char *message
     }
     
     ESP_LOGI(TAG, "SEND START to %s", phone_number);
+    g_gsm_ctx.status = GSM_STATUS_SENDING_SMS;
     
     // Clear any pending data
     clear_uart_buffer();
@@ -390,6 +499,7 @@ static esp_err_t internal_send_sms(const char *phone_number, const char *message
     esp_err_t ret = send_at_command("AT+CMGF=1", "OK", 5000, false);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed text mode");
+        g_gsm_ctx.status = GSM_STATUS_READY;
         xSemaphoreGive(g_gsm_ctx.mutex);
         return ret;
     }
@@ -402,6 +512,7 @@ static esp_err_t internal_send_sms(const char *phone_number, const char *message
     ret = send_at_command(sms_cmd, ">", 5000, false);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed SMS start");
+        g_gsm_ctx.status = GSM_STATUS_READY;
         xSemaphoreGive(g_gsm_ctx.mutex);
         return ret;
     }
@@ -415,6 +526,7 @@ static esp_err_t internal_send_sms(const char *phone_number, const char *message
     int bytes_written = uart_write_bytes(g_gsm_ctx.config.uart_port, full_message, strlen(full_message));
     if (bytes_written != strlen(full_message)) {
         ESP_LOGE(TAG, "Failed to write message");
+        g_gsm_ctx.status = GSM_STATUS_READY;
         xSemaphoreGive(g_gsm_ctx.mutex);
         return ESP_FAIL;
     }
@@ -433,6 +545,7 @@ static esp_err_t internal_send_sms(const char *phone_number, const char *message
         ESP_LOGE(TAG, "❌ SMS FAILED to %s", phone_number);
     }
     
+    g_gsm_ctx.status = GSM_STATUS_READY;
     xSemaphoreGive(g_gsm_ctx.mutex);
     return ret;
 }
@@ -448,8 +561,8 @@ esp_err_t gsm_send_sms(const char *phone_number, const char *message, uint32_t t
  * @brief Send SMS message (non-blocking)
  */
 esp_err_t gsm_send_sms_async(const char *phone_number, const char *message) {
-    if (!g_gsm_ctx.initialized || g_gsm_ctx.sms_queue == NULL) {
-        return ESP_FAIL;
+    if (!g_gsm_ctx.initialized || !g_gsm_ctx.module_ready || g_gsm_ctx.sms_queue == NULL) {
+        return ESP_ERR_INVALID_STATE;
     }
     
     sms_message_t sms = {0};
@@ -488,8 +601,8 @@ static void async_sms_task(void *arg) {
  * @brief Check for new SMS messages - FIXED VERSION
  */
 esp_err_t gsm_check_sms(bool delete_after_read) {
-    if (!g_gsm_ctx.initialized) {
-        return ESP_FAIL;
+    if (!g_gsm_ctx.initialized || !g_gsm_ctx.module_ready) {
+        return ESP_ERR_INVALID_STATE;
     }
     
     // Take mutex
@@ -502,6 +615,7 @@ esp_err_t gsm_check_sms(bool delete_after_read) {
     // List ALL SMS (read and unread)
     esp_err_t ret = send_at_command("AT+CMGL=\"ALL\"", "OK", 10000, false);
     
+    uint8_t indexes[10];
     int sms_count = 0;
     
     if (ret == ESP_OK) {
@@ -516,24 +630,30 @@ esp_err_t gsm_check_sms(bool delete_after_read) {
             
             ESP_LOGI(TAG, "Found SMS at index %d, reading...", index);
             
-            // Read and process this SMS
-            if (read_and_process_sms(index, delete_after_read) == ESP_OK) {
-                sms_count++;
+            if (sms_count < (int)(sizeof(indexes) / sizeof(indexes[0]))) {
+                indexes[sms_count++] = index;
             }
             
             // Move to next position
             ptr++;
         }
     }
+
+    int processed_count = 0;
+    for (int i = 0; i < sms_count; i++) {
+        if (read_and_process_sms(indexes[i], delete_after_read) == ESP_OK) {
+            processed_count++;
+        }
+    }
     
-    if (sms_count > 0) {
-        ESP_LOGI(TAG, "Processed %d SMS messages", sms_count);
+    if (processed_count > 0) {
+        ESP_LOGI(TAG, "Processed %d SMS messages", processed_count);
     } else {
         ESP_LOGD(TAG, "No SMS found");
     }
     
     xSemaphoreGive(g_gsm_ctx.mutex);
-    return (sms_count > 0) ? ESP_OK : ESP_FAIL;
+    return (processed_count > 0) ? ESP_OK : ESP_FAIL;
 }
 
 /**
@@ -679,9 +799,11 @@ esp_err_t gsm_reset(void) {
     
     if (ret == ESP_OK) {
         g_gsm_ctx.status = GSM_STATUS_READY;
+        g_gsm_ctx.module_ready = true;
         ESP_LOGI(TAG, "Reset OK");
     } else {
         g_gsm_ctx.status = GSM_STATUS_ERROR;
+        g_gsm_ctx.module_ready = false;
         ESP_LOGE(TAG, "Reset failed");
     }
     
