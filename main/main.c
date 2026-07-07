@@ -24,6 +24,8 @@
 #include "wifi_driver_abstraction.h"
 #include "mqtt_client_abstraction.h"
 #include "mqtt_topic.h"
+#include "geo_utils.h"
+#include "location_lookup.h"
 #include "cJSON.h"
 #include "nvs_flash.h"
 #include "esp_event.h"
@@ -90,13 +92,20 @@ static const char *TAG = "SMART_BIN";
 
 /* Peer registry */
 #define MAX_PEERS 16
+#define PEER_TIMEOUT_SEC          30
+#define REDIRECT_MAX_DISTANCE_M   500
+#define REDIRECT_DEBOUNCE_MS      10000
+#define REDIRECT_DISPLAY_MS       12000
+#define LOCATION_NAME_LEN         32
 typedef struct {
     char id[13];
-    float lat;
-    float lon;
+    double lat;
+    double lon;
+    float alt;
     uint8_t fill;
     bool active;
     uint32_t last_seen;
+    char name[LOCATION_NAME_LEN];
 } peer_t;
 
 /* ========== Global Handles ========== */
@@ -116,9 +125,13 @@ static bool s_gps_valid = false;
 
 static SemaphoreHandle_t s_peers_mutex = NULL;
 static peer_t s_peers[MAX_PEERS] = {0};
+static char s_bin_id[13] = {0};
 static bool s_wifi_connected = false;
 static bool s_mqtt_connected = false;
-static bool s_redirect_pending = false;   // set when bin becomes full
+static uint32_t s_last_redirect_ms = 0;
+static uint32_t s_redirect_display_until_ms = 0;
+static char s_redirect_lcd_line3[21] = "";
+static char s_redirect_lcd_line4[21] = "";
 
 static uint8_t s_stable_fill = 0;          // filtered, debounced fill level
 static uint64_t s_last_fill_update_us = 0; // timestamp of last update
@@ -148,17 +161,6 @@ static void on_sms_received(const received_sms_t *sms);
 /* ========== Helper Functions ========== */
 static uint32_t get_time_ms(void) {
     return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
-}
-
-static float haversine_distance(double lat1, double lon1, double lat2, double lon2) {
-    double R = 6371000.0;
-    double phi1 = lat1 * M_PI / 180.0;
-    double phi2 = lat2 * M_PI / 180.0;
-    double dphi = (lat2 - lat1) * M_PI / 180.0;
-    double dlambda = (lon2 - lon1) * M_PI / 180.0;
-    double a = sin(dphi/2)*sin(dphi/2) + cos(phi1)*cos(phi2)*sin(dlambda/2)*sin(dlambda/2);
-    double c = 2.0 * atan2(sqrt(a), sqrt(1.0 - a));
-    return (float)(R * c);
 }
 
 static uint32_t median_filter_5(uint32_t *buf) {
@@ -257,6 +259,13 @@ static void play_gentle_fade(void) {
 }
 
 /* ========== LCD Updates ========== */
+static void lcd_format_line(char out[21], const char *text)
+{
+    char tmp[21];
+    snprintf(tmp, sizeof(tmp), "%s", text ? text : "");
+    snprintf(out, 21, "%-20.20s", tmp);
+}
+
 static void update_lcd_main(const char *line1, const char *line2) {
     static char last1[21] = "", last2[21] = "";
     if (strcmp(last1, line1) != 0 || strcmp(last2, line2) != 0) {
@@ -279,17 +288,27 @@ static void update_lcd_gps_fill(void)
     if ((now_us - last_update_us) < 200000) return; // 200 ms minimum
 
     char new3[21], new4[21];
-    snprintf(new3, sizeof(new3), "Fill: %3d%%", s_current_fill);
-    if (s_gps_valid) {
+    if (s_redirect_display_until_ms > get_time_ms()) {
+        lcd_format_line(new3, s_redirect_lcd_line3);
+        lcd_format_line(new4, s_redirect_lcd_line4);
+    } else if (s_gps_valid) {
         double lat, lon;
         if (xSemaphoreTake(s_gps_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
             lat = s_last_gps.latitude;
             lon = s_last_gps.longitude;
             xSemaphoreGive(s_gps_mutex);
         } else { lat = 0; lon = 0; }
-        snprintf(new4, sizeof(new4), "%.6f %.6f", lat, lon);
+        char fill_line[21];
+        char gps_line[21];
+        snprintf(fill_line, sizeof(fill_line), "Fill: %3d%%", s_current_fill);
+        snprintf(gps_line, sizeof(gps_line), "%.6f %.6f", lat, lon);
+        lcd_format_line(new3, fill_line);
+        lcd_format_line(new4, gps_line);
     } else {
-        snprintf(new4, sizeof(new4), "GPS: no fix");
+        char fill_line[21];
+        snprintf(fill_line, sizeof(fill_line), "Fill: %3d%%", s_current_fill);
+        lcd_format_line(new3, fill_line);
+        lcd_format_line(new4, "GPS: no fix");
     }
     if (strcmp(line3, new3) != 0) {
         lcd_driver_write_string(s_lcd, 2, 0, new3);
@@ -311,6 +330,238 @@ static void update_leds(system_state_t state) {
     } else if (state == STATE_LID_OPEN || state == STATE_LID_CLOSE_WAIT) {
         led_driver_on(s_led_green);
     }
+}
+
+/* ========== Re-direction ========== */
+typedef struct {
+    peer_t peer;
+    uint32_t distance_m;
+    double bearing_deg;
+    char direction[4];
+    char display_name[LOCATION_NAME_LEN];
+    bool has_friendly_name;
+} redirect_target_t;
+
+static bool get_current_gps(double *lat, double *lon)
+{
+    bool valid = false;
+
+    if (xSemaphoreTake(s_gps_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        valid = s_gps_valid &&
+                s_last_gps.latitude != 0.0 &&
+                s_last_gps.longitude != 0.0;
+        if (valid) {
+            *lat = s_last_gps.latitude;
+            *lon = s_last_gps.longitude;
+        }
+        xSemaphoreGive(s_gps_mutex);
+    }
+
+    return valid;
+}
+
+static bool resolve_location_name(double lat, double lon, char *name, size_t name_size)
+{
+    if (!name || name_size == 0) {
+        return false;
+    }
+
+    name[0] = '\0';
+    return location_lookup_find(lat, lon, name, name_size);
+}
+
+static bool get_current_position(double *lat,
+                                 double *lon,
+                                 float *alt,
+                                 char *name,
+                                 size_t name_size)
+{
+    bool valid = false;
+    double local_lat = 0.0;
+    double local_lon = 0.0;
+    float local_alt = 0.0f;
+
+    if (name && name_size > 0) {
+        name[0] = '\0';
+    }
+
+    if (xSemaphoreTake(s_gps_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        valid = s_gps_valid &&
+                s_last_gps.latitude != 0.0 &&
+                s_last_gps.longitude != 0.0;
+        if (valid) {
+            local_lat = s_last_gps.latitude;
+            local_lon = s_last_gps.longitude;
+            local_alt = s_last_gps.altitude;
+        }
+        xSemaphoreGive(s_gps_mutex);
+    }
+
+    if (!valid) {
+        return false;
+    }
+
+    if (lat) {
+        *lat = local_lat;
+    }
+    if (lon) {
+        *lon = local_lon;
+    }
+    if (alt) {
+        *alt = local_alt;
+    }
+    if (name && name_size > 0) {
+        resolve_location_name(local_lat, local_lon, name, name_size);
+    }
+
+    return true;
+}
+
+static void format_local_bin_payload(char *payload,
+                                     size_t payload_size,
+                                     const char *id,
+                                     uint32_t now_s)
+{
+    double lat = 0.0;
+    double lon = 0.0;
+    float alt = 0.0f;
+    char name[LOCATION_NAME_LEN] = "";
+
+    if (get_current_position(&lat, &lon, &alt, name, sizeof(name))) {
+        snprintf(payload, payload_size,
+                 "{\"id\":\"%s\",\"fill\":%d,\"lat\":%.6f,\"lon\":%.6f,"
+                 "\"alt\":%.1f,\"name\":\"%s\",\"timestamp\":%lu}",
+                 id, s_current_fill, lat, lon, (double)alt, name,
+                 (unsigned long)now_s);
+    } else {
+        snprintf(payload, payload_size,
+                 "{\"id\":\"%s\",\"fill\":%d,\"lat\":null,\"lon\":null,"
+                 "\"alt\":null,\"name\":\"\",\"timestamp\":%lu}",
+                 id, s_current_fill, (unsigned long)now_s);
+    }
+}
+
+static void redirect_set_detail_lines(const char *line3, const char *line4, uint32_t now_ms)
+{
+    snprintf(s_redirect_lcd_line3, sizeof(s_redirect_lcd_line3), "%s", line3 ? line3 : "");
+    snprintf(s_redirect_lcd_line4, sizeof(s_redirect_lcd_line4), "%s", line4 ? line4 : "");
+    s_redirect_display_until_ms = now_ms + REDIRECT_DISPLAY_MS;
+}
+
+static void redirect_show_status(const char *line1,
+                                 const char *line2,
+                                 const char *line3,
+                                 const char *line4,
+                                 uint32_t now_ms)
+{
+    update_lcd_main(line1, line2);
+    redirect_set_detail_lines(line3, line4, now_ms);
+    update_lcd_gps_fill();
+}
+
+static bool redirect_find_nearest(double my_lat, double my_lon, redirect_target_t *target)
+{
+    if (!target) {
+        return false;
+    }
+
+    uint32_t now_s = get_time_ms() / 1000;
+    bool found = false;
+    uint32_t best_distance = UINT32_MAX;
+    peer_t best_peer = {0};
+
+    if (xSemaphoreTake(s_peers_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return false;
+    }
+
+    for (int i = 0; i < MAX_PEERS; i++) {
+        const peer_t *peer = &s_peers[i];
+        if (!peer->active ||
+            peer->fill >= FULL_PERCENT ||
+            peer->lat == 0.0 ||
+            peer->lon == 0.0 ||
+            (now_s - peer->last_seen) > PEER_TIMEOUT_SEC) {
+            continue;
+        }
+
+        uint32_t distance = geo_distance(my_lat, my_lon, peer->lat, peer->lon);
+        if (distance <= REDIRECT_MAX_DISTANCE_M && distance < best_distance) {
+            best_distance = distance;
+            best_peer = *peer;
+            found = true;
+        }
+    }
+
+    xSemaphoreGive(s_peers_mutex);
+
+    if (!found) {
+        return false;
+    }
+
+    memset(target, 0, sizeof(*target));
+    target->peer = best_peer;
+    target->distance_m = best_distance;
+    target->bearing_deg = geo_bearing(my_lat, my_lon, best_peer.lat, best_peer.lon);
+    strlcpy(target->direction,
+            geo_bearing_to_cardinal(target->bearing_deg),
+            sizeof(target->direction));
+
+    if (best_peer.name[0] != '\0') {
+        strlcpy(target->display_name, best_peer.name, sizeof(target->display_name));
+        target->has_friendly_name = true;
+    } else if (resolve_location_name(best_peer.lat, best_peer.lon,
+                                     target->display_name,
+                                     sizeof(target->display_name))) {
+        target->has_friendly_name = true;
+    } else {
+        snprintf(target->display_name, sizeof(target->display_name),
+                 "bin %.6s", best_peer.id);
+        target->has_friendly_name = false;
+    }
+
+    return true;
+}
+
+static void redirect_show_nearest(uint32_t now_ms)
+{
+    if (s_last_redirect_ms != 0 &&
+        (now_ms - s_last_redirect_ms) < REDIRECT_DEBOUNCE_MS) {
+        return;
+    }
+    s_last_redirect_ms = now_ms;
+
+    double my_lat = 0.0;
+    double my_lon = 0.0;
+    if (!get_current_gps(&my_lat, &my_lon)) {
+        redirect_show_status("Bin full", "GPS not ready",
+                             "Cannot redirect", "Try nearby bin", now_ms);
+        ESP_LOGW(TAG, "Redirect skipped: own GPS fix is not valid");
+        return;
+    }
+
+    redirect_target_t target;
+    if (!redirect_find_nearest(my_lat, my_lon, &target)) {
+        redirect_show_status("Bin full", "No free bin found",
+                             "Wait collector", "or try nearby", now_ms);
+        ESP_LOGW(TAG, "Redirect skipped: no active available peer within %dm",
+                 REDIRECT_MAX_DISTANCE_M);
+        return;
+    }
+
+    char line2[21];
+    char line3[21];
+    snprintf(line2, sizeof(line2), "Use %.16s", target.display_name);
+    snprintf(line3, sizeof(line3), "About %lum %s",
+             (unsigned long)target.distance_m, target.direction);
+
+    redirect_show_status("Bin full", line2, line3,
+                         target.has_friendly_name ? "Nearest free bin" : "Name not mapped",
+                         now_ms);
+    ESP_LOGI(TAG, "Redirect to %s (%s) at %lu m %s",
+             target.peer.id,
+             target.display_name,
+             (unsigned long)target.distance_m,
+             target.direction);
 }
 
 /* ========== GPS Task ========== */
@@ -738,6 +989,171 @@ static void wifi_event_cb(wifi_driver_event_t event, void *data) {
     }
 }
 
+static bool json_get_number(cJSON *root, const char *key, double *out)
+{
+    cJSON *item = cJSON_GetObjectItem(root, key);
+    if (!cJSON_IsNumber(item)) {
+        return false;
+    }
+
+    *out = item->valuedouble;
+    return true;
+}
+
+static bool json_get_int(cJSON *root, const char *key, int *out)
+{
+    cJSON *item = cJSON_GetObjectItem(root, key);
+    if (!cJSON_IsNumber(item)) {
+        return false;
+    }
+
+    *out = item->valueint;
+    return true;
+}
+
+static bool topic_extract_peer_id(const char *topic,
+                                  const char *suffix,
+                                  char *id,
+                                  size_t id_size)
+{
+    const char *prefix = "smartbin/bin/";
+    size_t prefix_len = strlen(prefix);
+
+    if (!topic || !suffix || !id || id_size == 0 ||
+        strncmp(topic, prefix, prefix_len) != 0) {
+        return false;
+    }
+
+    const char *start = topic + prefix_len;
+    const char *end = strstr(start, suffix);
+    if (!end || end == start) {
+        return false;
+    }
+
+    size_t len = (size_t)(end - start);
+    if (len >= id_size) {
+        len = id_size - 1;
+    }
+
+    memcpy(id, start, len);
+    id[len] = '\0';
+    return true;
+}
+
+static void peer_registry_mark_offline(const char *id)
+{
+    if (!id || id[0] == '\0' || strcmp(id, s_bin_id) == 0) {
+        return;
+    }
+
+    if (xSemaphoreTake(s_peers_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        for (int i = 0; i < MAX_PEERS; i++) {
+            if (s_peers[i].active && strcmp(s_peers[i].id, id) == 0) {
+                s_peers[i].active = false;
+                ESP_LOGI(TAG, "Peer %s marked offline", id);
+                break;
+            }
+        }
+        xSemaphoreGive(s_peers_mutex);
+    }
+}
+
+static void peer_registry_upsert(const char *id,
+                                 double lat,
+                                 double lon,
+                                 float alt,
+                                 int fill,
+                                 const char *name)
+{
+    if (!id || id[0] == '\0' || strcmp(id, s_bin_id) == 0 ||
+        lat == 0.0 || lon == 0.0) {
+        return;
+    }
+
+    char resolved_name[LOCATION_NAME_LEN] = "";
+    if (name && name[0] != '\0') {
+        strlcpy(resolved_name, name, sizeof(resolved_name));
+    } else {
+        resolve_location_name(lat, lon, resolved_name, sizeof(resolved_name));
+    }
+
+    if (fill < 0) {
+        fill = 0;
+    } else if (fill > 100) {
+        fill = 100;
+    }
+
+    if (xSemaphoreTake(s_peers_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return;
+    }
+
+    peer_t *peer = NULL;
+    for (int i = 0; i < MAX_PEERS; i++) {
+        if (strcmp(s_peers[i].id, id) == 0) {
+            peer = &s_peers[i];
+            break;
+        }
+    }
+    if (!peer) {
+        for (int i = 0; i < MAX_PEERS; i++) {
+            if (!s_peers[i].active && s_peers[i].id[0] == '\0') {
+                peer = &s_peers[i];
+                break;
+            }
+        }
+    }
+    if (!peer) {
+        for (int i = 0; i < MAX_PEERS; i++) {
+            if (!s_peers[i].active) {
+                peer = &s_peers[i];
+                break;
+            }
+        }
+    }
+
+    if (peer) {
+        memset(peer, 0, sizeof(*peer));
+        strlcpy(peer->id, id, sizeof(peer->id));
+        peer->lat = lat;
+        peer->lon = lon;
+        peer->alt = alt;
+        peer->fill = (uint8_t)fill;
+        peer->active = true;
+        peer->last_seen = get_time_ms() / 1000;
+        strlcpy(peer->name, resolved_name, sizeof(peer->name));
+        ESP_LOGI(TAG, "Peer %s: fill=%d, name=%s", id, fill,
+                 peer->name[0] ? peer->name : "unmapped");
+    }
+
+    xSemaphoreGive(s_peers_mutex);
+}
+
+static void peer_registry_update_from_payload(const char *fallback_id, const char *payload)
+{
+    cJSON *root = cJSON_Parse(payload);
+    if (!root) {
+        return;
+    }
+
+    const char *id = cJSON_GetStringValue(cJSON_GetObjectItem(root, "id"));
+    if (!id || id[0] == '\0') {
+        id = fallback_id;
+    }
+
+    double lat = 0.0;
+    double lon = 0.0;
+    double alt = 0.0;
+    int fill = 100;
+    json_get_number(root, "lat", &lat);
+    json_get_number(root, "lon", &lon);
+    json_get_number(root, "alt", &alt);
+    json_get_int(root, "fill", &fill);
+
+    const char *name = cJSON_GetStringValue(cJSON_GetObjectItem(root, "name"));
+    peer_registry_upsert(id, lat, lon, (float)alt, fill, name);
+    cJSON_Delete(root);
+}
+
 static void mqtt_event_cb(mqtt_client_event_t event, void *data) {
     if (event == MQTT_CLIENT_EVENT_CONNECTED) {
         ESP_LOGI(TAG, "MQTT connected");
@@ -763,39 +1179,14 @@ static void mqtt_event_cb(mqtt_client_event_t event, void *data) {
         payload[msg->payload_len] = '\0';
 
         if (strcmp(topic, "smartbin/discovery/announce") == 0) {
-            cJSON *root = cJSON_Parse(payload);
-            if (root) {
-                const char *id = cJSON_GetStringValue(cJSON_GetObjectItem(root, "id"));
-                double lat = cJSON_GetObjectItem(root, "lat")->valuedouble;
-                double lon = cJSON_GetObjectItem(root, "lon")->valuedouble;
-                int fill = cJSON_GetObjectItem(root, "fill")->valueint;
-                if (id && lat != 0 && lon != 0) {
-                    if (xSemaphoreTake(s_peers_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                        peer_t *p = NULL;
-                        for (int i = 0; i < MAX_PEERS; i++) {
-                            if (s_peers[i].active && strcmp(s_peers[i].id, id) == 0) {
-                                p = &s_peers[i]; break;
-                            }
-                        }
-                        if (!p) {
-                            for (int i = 0; i < MAX_PEERS; i++) {
-                                if (!s_peers[i].active) {
-                                    p = &s_peers[i]; break;
-                                }
-                            }
-                        }
-                        if (p) {
-                            strlcpy(p->id, id, sizeof(p->id));
-                            p->lat = lat;
-                            p->lon = lon;
-                            p->fill = fill;
-                            p->active = true;
-                            p->last_seen = get_time_ms() / 1000;
-                        }
-                        xSemaphoreGive(s_peers_mutex);
-                    }
-                }
-                cJSON_Delete(root);
+            peer_registry_update_from_payload(NULL, payload);
+        } else {
+            char peer_id[13];
+            if (topic_extract_peer_id(topic, "/state", peer_id, sizeof(peer_id))) {
+                peer_registry_update_from_payload(peer_id, payload);
+            } else if (topic_extract_peer_id(topic, "/lwt", peer_id, sizeof(peer_id)) &&
+                       strcmp(payload, "OFFLINE") == 0) {
+                peer_registry_mark_offline(peer_id);
             }
         }
     }
@@ -815,6 +1206,7 @@ static void mqtt_network_task(void *pvParameters)
     char mac_str[13];
     snprintf(mac_str, sizeof(mac_str), "%02x%02x%02x%02x%02x%02x",
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    strlcpy(s_bin_id, mac_str, sizeof(s_bin_id));
     char client_id[20];
     snprintf(client_id, sizeof(client_id), "bin_%s", mac_str);
 
@@ -825,9 +1217,12 @@ static void mqtt_network_task(void *pvParameters)
     char lwt_topic[64];
     snprintf(lwt_topic, sizeof(lwt_topic), "smartbin/bin/%s/lwt", mac_str);
 
-    uint32_t last_publish = 0, last_heartbeat = 0, last_state = 0, last_expiry = 0;
+    uint32_t last_publish = 0;
+    uint32_t last_heartbeat = 0;
+    uint32_t last_state = 0;
+    uint32_t last_expiry = 0;
+    uint32_t last_discovery = 0;
     bool mqtt_initialised = false;
-    uint32_t last_wifi_check = 0;
 
     while (1) {
         uint32_t now = get_time_ms() / 1000;
@@ -875,72 +1270,43 @@ static void mqtt_network_task(void *pvParameters)
         // If MQTT is connected, publish data
         if (s_mqtt_connected) {
             // Publish data to devices/ topic every 10 seconds
-            if ((now - last_publish) >= 10) {
+            if (last_publish == 0 || (now - last_publish) >= 10) {
                 char topic[128];
                 mqtt_topic_build(topic, sizeof(topic), "data");
                 char payload[256];
-                if (s_gps_valid) {
-                    double lat, lon;
-                    if (xSemaphoreTake(s_gps_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                        lat = s_last_gps.latitude;
-                        lon = s_last_gps.longitude;
-                        xSemaphoreGive(s_gps_mutex);
-                    } else { lat = 0; lon = 0; }
-                    snprintf(payload, sizeof(payload),
-                             "{\"fill\":%d,\"lat\":%.6f,\"lon\":%.6f,\"alt\":%.1f}",
-                             s_current_fill, lat, lon, (double)s_last_gps.altitude);
-                } else {
-                    snprintf(payload, sizeof(payload), "{\"fill\":%d,\"lat\":null,\"lon\":null,\"alt\":null}",
-                             s_current_fill);
-                }
+                format_local_bin_payload(payload, sizeof(payload), mac_str, now);
                 mqtt_client_publish(topic, payload, strlen(payload), 1, false);
                 last_publish = now;
             }
 
+            // Publish discovery so nearby bins can build their redirect peer lists.
+            if (last_discovery == 0 || (now - last_discovery) >= 30) {
+                char payload[256];
+                format_local_bin_payload(payload, sizeof(payload), mac_str, now);
+                mqtt_client_publish("smartbin/discovery/announce",
+                                    payload,
+                                    strlen(payload),
+                                    1,
+                                    false);
+                last_discovery = now;
+            }
+
             // Publish to smartbin/bin/<mac>/state every 30 seconds
-            if ((now - last_state) >= 30) {
+            if (last_state == 0 || (now - last_state) >= 30) {
                 char topic[128];
                 snprintf(topic, sizeof(topic), "smartbin/bin/%s/state", mac_str);
                 char payload[256];
-                if (s_gps_valid) {
-                    double lat, lon;
-                    if (xSemaphoreTake(s_gps_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                        lat = s_last_gps.latitude;
-                        lon = s_last_gps.longitude;
-                        xSemaphoreGive(s_gps_mutex);
-                    } else { lat = 0; lon = 0; }
-                    snprintf(payload, sizeof(payload),
-                             "{\"fill\":%d,\"lat\":%.6f,\"lon\":%.6f,\"timestamp\":%lu}",
-                             s_current_fill, lat, lon, now);
-                } else {
-                    snprintf(payload, sizeof(payload),
-                             "{\"fill\":%d,\"lat\":null,\"lon\":null,\"timestamp\":%lu}",
-                             s_current_fill, now);
-                }
+                format_local_bin_payload(payload, sizeof(payload), mac_str, now);
                 mqtt_client_publish(topic, payload, strlen(payload), 1, false);
                 last_state = now;
             }
 
             // Publish to smartbin/cloud/bin/<mac>/heartbeat every 30 seconds
-            if ((now - last_heartbeat) >= 30) {
+            if (last_heartbeat == 0 || (now - last_heartbeat) >= 30) {
                 char topic[128];
                 snprintf(topic, sizeof(topic), "smartbin/cloud/bin/%s/heartbeat", mac_str);
                 char payload[256];
-                if (s_gps_valid) {
-                    double lat, lon;
-                    if (xSemaphoreTake(s_gps_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                        lat = s_last_gps.latitude;
-                        lon = s_last_gps.longitude;
-                        xSemaphoreGive(s_gps_mutex);
-                    } else { lat = 0; lon = 0; }
-                    snprintf(payload, sizeof(payload),
-                             "{\"fill\":%d,\"lat\":%.6f,\"lon\":%.6f,\"timestamp\":%lu}",
-                             s_current_fill, lat, lon, now);
-                } else {
-                    snprintf(payload, sizeof(payload),
-                             "{\"fill\":%d,\"lat\":null,\"lon\":null,\"timestamp\":%lu}",
-                             s_current_fill, now);
-                }
+                format_local_bin_payload(payload, sizeof(payload), mac_str, now);
                 mqtt_client_publish(topic, payload, strlen(payload), 1, false);
                 last_heartbeat = now;
             }
@@ -949,49 +1315,14 @@ static void mqtt_network_task(void *pvParameters)
             if ((now - last_expiry) >= 10) {
                 if (xSemaphoreTake(s_peers_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
                     for (int i = 0; i < MAX_PEERS; i++) {
-                        if (s_peers[i].active && (now - s_peers[i].last_seen) > 30) {
+                        if (s_peers[i].active &&
+                            (now - s_peers[i].last_seen) > PEER_TIMEOUT_SEC) {
                             s_peers[i].active = false;
                         }
                     }
                     xSemaphoreGive(s_peers_mutex);
                 }
                 last_expiry = now;
-            }
-
-            // Handle redirect when bin becomes full
-            if (s_redirect_pending) {
-                s_redirect_pending = false;
-                peer_t *nearest = NULL;
-                float min_dist = INFINITY;
-                if (xSemaphoreTake(s_peers_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                    if (s_gps_valid) {
-                        double my_lat, my_lon;
-                        if (xSemaphoreTake(s_gps_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                            my_lat = s_last_gps.latitude;
-                            my_lon = s_last_gps.longitude;
-                            xSemaphoreGive(s_gps_mutex);
-                        } else { my_lat = 0; my_lon = 0; }
-                        for (int i = 0; i < MAX_PEERS; i++) {
-                            if (s_peers[i].active && s_peers[i].fill < 100) {
-                                float dist = haversine_distance(my_lat, my_lon,
-                                                                 s_peers[i].lat, s_peers[i].lon);
-                                if (dist < min_dist) {
-                                    min_dist = dist;
-                                    nearest = &s_peers[i];
-                                }
-                            }
-                        }
-                    }
-                    xSemaphoreGive(s_peers_mutex);
-                }
-                if (nearest) {
-                    char msg[32];
-                    snprintf(msg, sizeof(msg), "Use bin %.0fm", min_dist);
-                    update_lcd_main("Bin full - redirect", msg);
-                    ESP_LOGI(TAG, "Redirect to %s at %.0f m", nearest->id, min_dist);
-                } else {
-                    update_lcd_main("Bin full", "No other bin");
-                }
             }
         }
 
@@ -1002,6 +1333,8 @@ static void mqtt_network_task(void *pvParameters)
 /* ========== Main Control Task ========== */
 static void control_task(void *pvParameters) {
     bool pir_detected = false;
+    bool full_mode_active = false;
+    bool full_user_mode = false;
     while (1) {
         uint32_t now = get_time_ms();
         pir_driver_read(s_pir, &pir_detected);
@@ -1021,9 +1354,46 @@ static void control_task(void *pvParameters) {
             // s_current_fill remains unchanged
         }
 
-        // Request redirect when bin becomes full (and not already in maintenance)
-        if (s_current_fill >= 100 && s_state != STATE_MAINTENANCE && !s_redirect_pending) {
-            s_redirect_pending = true;
+        bool bin_full = (s_current_fill >= FULL_PERCENT);
+        bool user_attempt = (pir_detected || hand);
+
+        if (bin_full &&
+            s_state != STATE_MAINTENANCE &&
+            s_state != STATE_LID_OPEN &&
+            s_state != STATE_LID_CLOSE_WAIT) {
+            if (s_state != STATE_IDLE) {
+                s_state = STATE_IDLE;
+            }
+
+            if (!full_mode_active || full_user_mode != user_attempt) {
+                led_driver_off(s_led_green);
+                led_driver_on(s_led_red);
+                led_driver_start_blink(s_led_red,
+                                       user_attempt ? 250 : 700,
+                                       user_attempt ? 70 : 45);
+                full_mode_active = true;
+                full_user_mode = user_attempt;
+            }
+
+            if (user_attempt) {
+                redirect_show_nearest(now);
+            } else if (s_redirect_display_until_ms <= now) {
+                update_lcd_main("Bin full", "Try nearby bin");
+            }
+
+            update_lcd_gps_fill();
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+
+        if (!bin_full && full_mode_active) {
+            s_redirect_display_until_ms = 0;
+            full_mode_active = false;
+            full_user_mode = false;
+            update_leds(s_state);
+            if (s_state == STATE_IDLE) {
+                update_lcd_main("Welcome", "");
+            }
         }
 
         switch (s_state) {
