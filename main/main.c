@@ -40,6 +40,14 @@ static const char *TAG = "SMART_BIN";
 #define MQTT_USER       "mqtt_user"
 #define MQTT_PASS       "ega12345"
 
+/* MQTT publish cadence */
+#define MQTT_DATA_PUBLISH_INTERVAL_MS         400
+#define MQTT_STATE_PUBLISH_INTERVAL_MS        5000
+#define MQTT_STATE_CHANGE_MIN_INTERVAL_MS     2000
+#define MQTT_HEARTBEAT_PUBLISH_INTERVAL_MS    15000
+#define MQTT_DISCOVERY_PUBLISH_INTERVAL_MS    15000
+#define MQTT_PEER_EXPIRY_CHECK_INTERVAL_MS    5000
+
 /* ========== Pin Definitions (All Safe) ========== */
 #define FILL_TRIG     18
 #define FILL_ECHO     34
@@ -64,17 +72,27 @@ static const char *TAG = "SMART_BIN";
 #define INTENT_TIMEOUT_MS      10000
 #define LID_OPEN_DURATION_MS   5000
 #define DISTANCE_THRESHOLD_CM  30
+#define SERVO_OPEN_ANGLE       90.0f
+#define SERVO_CLOSED_ANGLE     0.0f
+#define SERVO_COMMAND_RETRIES  3
+#define SERVO_RETRY_DELAY_MS   120
+#define MAINTENANCE_SERVO_HOLD_MS 2000
+#define GPS_FIX_STALE_MS       120000
+#define GPS_MIN_LAT            (-6.30)
+#define GPS_MAX_LAT            (-6.10)
+#define GPS_MIN_LON            35.70
+#define GPS_MAX_LON            35.90
 
 /* GSM thresholds */
 #define NEAR_FULL_PERCENT  75
-#define FULL_PERCENT       100
+#define FULL_PERCENT       94
 #define DEBOUNCE_SEC       300
 #define COLLECTOR_PHONE    "+255688173415"
 #define MANAGER_PHONE      COLLECTOR_PHONE
 #define GSM_PASSWORD       "SECRET123"
 #define GSM_INIT_RETRY_INTERVAL_MS  30000
 #define GSM_SMS_RETRY_INTERVAL_SEC  60
-#define GSM_POLL_INTERVAL_MS        5000
+#define GSM_POLL_INTERVAL_MS        2000
 #define GSM_SEND_TIMEOUT_MS         45000
 #define GSM_SEND_ATTEMPTS           2
 #define GSM_REINIT_AFTER_FAILURES   3
@@ -92,9 +110,10 @@ static const char *TAG = "SMART_BIN";
 
 /* Peer registry */
 #define MAX_PEERS 16
-#define PEER_TIMEOUT_SEC          30
-#define REDIRECT_MAX_DISTANCE_M   500
+#define PEER_TIMEOUT_SEC          180
+#define REDIRECT_MAX_DISTANCE_M   1500
 #define REDIRECT_DEBOUNCE_MS      10000
+#define REDIRECT_FAILURE_RETRY_MS 1500
 #define REDIRECT_DISPLAY_MS       12000
 #define LOCATION_NAME_LEN         32
 typedef struct {
@@ -122,16 +141,20 @@ static lcd_handle_t s_lcd = NULL;
 static SemaphoreHandle_t s_gps_mutex = NULL;
 static gps_data_t s_last_gps = {0};
 static bool s_gps_valid = false;
+static uint32_t s_last_gps_fix_ms = 0;
 
+static SemaphoreHandle_t s_servo_mutex = NULL;
 static SemaphoreHandle_t s_peers_mutex = NULL;
 static peer_t s_peers[MAX_PEERS] = {0};
 static char s_bin_id[13] = {0};
 static bool s_wifi_connected = false;
 static bool s_mqtt_connected = false;
 static uint32_t s_last_redirect_ms = 0;
+static bool s_redirect_last_success = false;
 static uint32_t s_redirect_display_until_ms = 0;
 static char s_redirect_lcd_line3[21] = "";
 static char s_redirect_lcd_line4[21] = "";
+static volatile bool s_maintenance_unlocked = false;
 
 static uint8_t s_stable_fill = 0;          // filtered, debounced fill level
 static uint64_t s_last_fill_update_us = 0; // timestamp of last update
@@ -152,7 +175,7 @@ typedef enum {
     STATE_LID_CLOSE_WAIT,
     STATE_MAINTENANCE
 } system_state_t;
-static system_state_t s_state = STATE_IDLE;
+static volatile system_state_t s_state = STATE_IDLE;
 static uint32_t s_attention_start_time = 0;
 static uint32_t s_lid_open_start_time = 0;
 
@@ -161,6 +184,12 @@ static void on_sms_received(const received_sms_t *sms);
 /* ========== Helper Functions ========== */
 static uint32_t get_time_ms(void) {
     return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+}
+
+static bool gps_coords_plausible(double lat, double lon)
+{
+    return lat >= GPS_MIN_LAT && lat <= GPS_MAX_LAT &&
+           lon >= GPS_MIN_LON && lon <= GPS_MAX_LON;
 }
 
 static uint32_t median_filter_5(uint32_t *buf) {
@@ -291,7 +320,9 @@ static void update_lcd_gps_fill(void)
     if (s_redirect_display_until_ms > get_time_ms()) {
         lcd_format_line(new3, s_redirect_lcd_line3);
         lcd_format_line(new4, s_redirect_lcd_line4);
-    } else if (s_gps_valid) {
+    } else if (s_gps_valid &&
+               gps_coords_plausible(s_last_gps.latitude, s_last_gps.longitude) &&
+               (get_time_ms() - s_last_gps_fix_ms) <= GPS_FIX_STALE_MS) {
         double lat, lon;
         if (xSemaphoreTake(s_gps_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
             lat = s_last_gps.latitude;
@@ -329,7 +360,65 @@ static void update_leds(system_state_t state) {
         led_driver_start_blink(s_led_red, 500, 50);
     } else if (state == STATE_LID_OPEN || state == STATE_LID_CLOSE_WAIT) {
         led_driver_on(s_led_green);
+    } else if (state == STATE_MAINTENANCE) {
+        led_driver_on(s_led_green);
     }
+}
+
+static esp_err_t lid_set_angle(float angle, const char *reason)
+{
+    if (!s_servo) {
+        ESP_LOGE(TAG, "Servo command ignored: driver not ready");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (s_servo_mutex &&
+        xSemaphoreTake(s_servo_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        ESP_LOGW(TAG, "Servo command timeout: %s", reason ? reason : "unknown");
+        return ESP_ERR_TIMEOUT;
+    }
+
+    esp_err_t last_ret = ESP_FAIL;
+    bool ok = false;
+    for (int attempt = 1; attempt <= SERVO_COMMAND_RETRIES; attempt++) {
+        last_ret = servo_driver_set_angle(s_servo, angle);
+        if (last_ret == ESP_OK) {
+            ok = true;
+        } else {
+            ESP_LOGW(TAG, "Servo command failed (%s) attempt %d/%d: %s",
+                     reason ? reason : "unknown",
+                     attempt,
+                     SERVO_COMMAND_RETRIES,
+                     esp_err_to_name(last_ret));
+        }
+
+        if (attempt < SERVO_COMMAND_RETRIES) {
+            vTaskDelay(pdMS_TO_TICKS(SERVO_RETRY_DELAY_MS));
+        }
+    }
+
+    if (s_servo_mutex) {
+        xSemaphoreGive(s_servo_mutex);
+    }
+
+    if (!ok) {
+        return last_ret;
+    }
+
+    ESP_LOGI(TAG, "Lid angle %.1f commanded (%s)",
+             (double)angle,
+             reason ? reason : "no reason");
+    return ESP_OK;
+}
+
+static esp_err_t lid_open(const char *reason)
+{
+    return lid_set_angle(SERVO_OPEN_ANGLE, reason);
+}
+
+static esp_err_t lid_close(const char *reason)
+{
+    return lid_set_angle(SERVO_CLOSED_ANGLE, reason);
 }
 
 /* ========== Re-direction ========== */
@@ -345,11 +434,14 @@ typedef struct {
 static bool get_current_gps(double *lat, double *lon)
 {
     bool valid = false;
+    uint32_t now_ms = get_time_ms();
 
     if (xSemaphoreTake(s_gps_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
         valid = s_gps_valid &&
                 s_last_gps.latitude != 0.0 &&
-                s_last_gps.longitude != 0.0;
+                s_last_gps.longitude != 0.0 &&
+                gps_coords_plausible(s_last_gps.latitude, s_last_gps.longitude) &&
+                (now_ms - s_last_gps_fix_ms) <= GPS_FIX_STALE_MS;
         if (valid) {
             *lat = s_last_gps.latitude;
             *lon = s_last_gps.longitude;
@@ -380,6 +472,7 @@ static bool get_current_position(double *lat,
     double local_lat = 0.0;
     double local_lon = 0.0;
     float local_alt = 0.0f;
+    uint32_t now_ms = get_time_ms();
 
     if (name && name_size > 0) {
         name[0] = '\0';
@@ -388,7 +481,9 @@ static bool get_current_position(double *lat,
     if (xSemaphoreTake(s_gps_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
         valid = s_gps_valid &&
                 s_last_gps.latitude != 0.0 &&
-                s_last_gps.longitude != 0.0;
+                s_last_gps.longitude != 0.0 &&
+                gps_coords_plausible(s_last_gps.latitude, s_last_gps.longitude) &&
+                (now_ms - s_last_gps_fix_ms) <= GPS_FIX_STALE_MS;
         if (valid) {
             local_lat = s_last_gps.latitude;
             local_lon = s_last_gps.longitude;
@@ -420,6 +515,7 @@ static bool get_current_position(double *lat,
 static void format_local_bin_payload(char *payload,
                                      size_t payload_size,
                                      const char *id,
+                                     uint8_t fill,
                                      uint32_t now_s)
 {
     double lat = 0.0;
@@ -431,13 +527,13 @@ static void format_local_bin_payload(char *payload,
         snprintf(payload, payload_size,
                  "{\"id\":\"%s\",\"fill\":%d,\"lat\":%.6f,\"lon\":%.6f,"
                  "\"alt\":%.1f,\"name\":\"%s\",\"timestamp\":%lu}",
-                 id, s_current_fill, lat, lon, (double)alt, name,
+                 id, fill, lat, lon, (double)alt, name,
                  (unsigned long)now_s);
     } else {
         snprintf(payload, payload_size,
                  "{\"id\":\"%s\",\"fill\":%d,\"lat\":null,\"lon\":null,"
                  "\"alt\":null,\"name\":\"\",\"timestamp\":%lu}",
-                 id, s_current_fill, (unsigned long)now_s);
+                 id, fill, (unsigned long)now_s);
     }
 }
 
@@ -469,6 +565,11 @@ static bool redirect_find_nearest(double my_lat, double my_lon, redirect_target_
     bool found = false;
     uint32_t best_distance = UINT32_MAX;
     peer_t best_peer = {0};
+    int active_count = 0;
+    int fresh_count = 0;
+    int gps_count = 0;
+    int free_count = 0;
+    int in_range_count = 0;
 
     if (xSemaphoreTake(s_peers_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
         return false;
@@ -476,15 +577,32 @@ static bool redirect_find_nearest(double my_lat, double my_lon, redirect_target_
 
     for (int i = 0; i < MAX_PEERS; i++) {
         const peer_t *peer = &s_peers[i];
-        if (!peer->active ||
-            peer->fill >= FULL_PERCENT ||
-            peer->lat == 0.0 ||
-            peer->lon == 0.0 ||
-            (now_s - peer->last_seen) > PEER_TIMEOUT_SEC) {
+        if (!peer->active) {
             continue;
         }
+        active_count++;
+
+        if ((now_s - peer->last_seen) > PEER_TIMEOUT_SEC) {
+            continue;
+        }
+        fresh_count++;
+
+        if (peer->lat == 0.0 ||
+            peer->lon == 0.0 ||
+            !gps_coords_plausible(peer->lat, peer->lon)) {
+            continue;
+        }
+        gps_count++;
+
+        if (peer->fill >= FULL_PERCENT) {
+            continue;
+        }
+        free_count++;
 
         uint32_t distance = geo_distance(my_lat, my_lon, peer->lat, peer->lon);
+        if (distance <= REDIRECT_MAX_DISTANCE_M) {
+            in_range_count++;
+        }
         if (distance <= REDIRECT_MAX_DISTANCE_M && distance < best_distance) {
             best_distance = distance;
             best_peer = *peer;
@@ -495,6 +613,13 @@ static bool redirect_find_nearest(double my_lat, double my_lon, redirect_target_
     xSemaphoreGive(s_peers_mutex);
 
     if (!found) {
+        ESP_LOGW(TAG,
+                 "Redirect peers checked: active=%d fresh=%d gps=%d free=%d in_range=%d",
+                 active_count,
+                 fresh_count,
+                 gps_count,
+                 free_count,
+                 in_range_count);
         return false;
     }
 
@@ -515,7 +640,7 @@ static bool redirect_find_nearest(double my_lat, double my_lon, redirect_target_
         target->has_friendly_name = true;
     } else {
         snprintf(target->display_name, sizeof(target->display_name),
-                 "bin %.6s", best_peer.id);
+                 "Bin %.12s", best_peer.id);
         target->has_friendly_name = false;
     }
 
@@ -524,8 +649,11 @@ static bool redirect_find_nearest(double my_lat, double my_lon, redirect_target_
 
 static void redirect_show_nearest(uint32_t now_ms)
 {
+    uint32_t retry_ms = s_redirect_last_success ?
+                        REDIRECT_DEBOUNCE_MS :
+                        REDIRECT_FAILURE_RETRY_MS;
     if (s_last_redirect_ms != 0 &&
-        (now_ms - s_last_redirect_ms) < REDIRECT_DEBOUNCE_MS) {
+        (now_ms - s_last_redirect_ms) < retry_ms) {
         return;
     }
     s_last_redirect_ms = now_ms;
@@ -533,6 +661,7 @@ static void redirect_show_nearest(uint32_t now_ms)
     double my_lat = 0.0;
     double my_lon = 0.0;
     if (!get_current_gps(&my_lat, &my_lon)) {
+        s_redirect_last_success = false;
         redirect_show_status("Bin full", "GPS not ready",
                              "Cannot redirect", "Try nearby bin", now_ms);
         ESP_LOGW(TAG, "Redirect skipped: own GPS fix is not valid");
@@ -541,6 +670,7 @@ static void redirect_show_nearest(uint32_t now_ms)
 
     redirect_target_t target;
     if (!redirect_find_nearest(my_lat, my_lon, &target)) {
+        s_redirect_last_success = false;
         redirect_show_status("Bin full", "No free bin found",
                              "Wait collector", "or try nearby", now_ms);
         ESP_LOGW(TAG, "Redirect skipped: no active available peer within %dm",
@@ -555,8 +685,17 @@ static void redirect_show_nearest(uint32_t now_ms)
              (unsigned long)target.distance_m, target.direction);
 
     redirect_show_status("Bin full", line2, line3,
-                         target.has_friendly_name ? "Nearest free bin" : "Name not mapped",
+                         target.has_friendly_name ? "Nearest free bin" : "GPS shown on web",
                          now_ms);
+    if (!target.has_friendly_name) {
+        char coords[21];
+        snprintf(coords, sizeof(coords), "%.4f %.4f",
+                 target.peer.lat,
+                 target.peer.lon);
+        redirect_set_detail_lines(line3, coords, now_ms);
+        update_lcd_gps_fill();
+    }
+    s_redirect_last_success = true;
     ESP_LOGI(TAG, "Redirect to %s (%s) at %lu m %s",
              target.peer.id,
              target.display_name,
@@ -570,13 +709,23 @@ static void gps_task(void *pvParameters) {
     while (1) {
         gps_data_t fix;
         esp_err_t ret = gps_proof_get_fix(&fix, 2000);
-        if (ret == ESP_OK && fix.fix_quality >= 1 && fix.latitude != 0.0 && fix.longitude != 0.0) {
+        if (ret == ESP_OK &&
+            fix.fix_quality >= 1 &&
+            fix.latitude != 0.0 &&
+            fix.longitude != 0.0 &&
+            gps_coords_plausible(fix.latitude, fix.longitude)) {
             if (xSemaphoreTake(s_gps_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
                 memcpy(&s_last_gps, &fix, sizeof(gps_data_t));
                 s_gps_valid = true;
+                s_last_gps_fix_ms = get_time_ms();
                 xSemaphoreGive(s_gps_mutex);
             }
-        } else if (s_gps_valid) {
+        } else if (ret == ESP_OK && fix.latitude != 0.0 && fix.longitude != 0.0) {
+            ESP_LOGW(TAG, "Ignoring implausible GPS fix: %.6f %.6f",
+                     fix.latitude,
+                     fix.longitude);
+        } else if (s_gps_valid &&
+                   (get_time_ms() - s_last_gps_fix_ms) > GPS_FIX_STALE_MS) {
             if (xSemaphoreTake(s_gps_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
                 s_gps_valid = false;
                 xSemaphoreGive(s_gps_mutex);
@@ -874,15 +1023,6 @@ static void gsm_task(void *pvParameters)
             continue;
         }
 
-        if (!boot_alert.sent) {
-            if (!gsm_try_alert(&boot_alert, now_s, "boot", COLLECTOR_PHONE,
-                               "Smart bin online. Ready for use.")) {
-                consecutive_gsm_failures++;
-            } else {
-                consecutive_gsm_failures = 0;
-            }
-        }
-
         if ((now_ms - last_sms_poll_ms) >= GSM_POLL_INTERVAL_MS) {
             esp_err_t ret = gsm_check_sms(true);
             if (ret == ESP_ERR_TIMEOUT || ret == ESP_ERR_INVALID_STATE) {
@@ -893,6 +1033,15 @@ static void gsm_task(void *pvParameters)
             }
             gsm_process_received_sms();
             last_sms_poll_ms = now_ms;
+        }
+
+        if (!boot_alert.sent) {
+            if (!gsm_try_alert(&boot_alert, now_s, "boot", COLLECTOR_PHONE,
+                               "Smart bin online. Ready for use.")) {
+                consecutive_gsm_failures++;
+            } else {
+                consecutive_gsm_failures = 0;
+            }
         }
 
         uint8_t fill = s_current_fill;
@@ -956,20 +1105,35 @@ static void on_sms_received(const received_sms_t *sms) {
     }
 
     if (sms_contains_ci(sms->message, "UNLOCK")) {
+        s_maintenance_unlocked = true;
         s_state = STATE_MAINTENANCE;
         update_lcd_main("Maintenance", "Unlocked");
-        led_driver_on(s_led_green);
-        servo_driver_set_angle(s_servo, 90.0f);
-        gsm_send_confirmed("unlock-ack", sms->sender, "Bin unlocked for maintenance.");
-        ESP_LOGI(TAG, "Maintenance mode activated");
+        update_leds(STATE_MAINTENANCE);
+        esp_err_t lid_ret = lid_open("sms maintenance unlock");
+        if (lid_ret == ESP_OK) {
+            gsm_send_confirmed("unlock-ack", sms->sender, "Bin unlocked for maintenance.");
+            ESP_LOGI(TAG, "Maintenance mode activated");
+        } else {
+            gsm_send_confirmed("unlock-ack-failed", sms->sender,
+                               "Unlock received, but lid motor failed. Check servo power.");
+            ESP_LOGE(TAG, "Maintenance unlock failed: %s", esp_err_to_name(lid_ret));
+        }
     } else if (sms_contains_ci(sms->message, "MAINTENANCE DONE") ||
                sms_contains_ci(sms->message, "LOCK")) {
-        servo_driver_set_angle(s_servo, 0.0f);
+        s_maintenance_unlocked = false;
+        esp_err_t lid_ret = lid_close("sms maintenance lock");
         s_state = STATE_IDLE;
         update_leds(s_state);
         update_lcd_main("Welcome", "");
-        gsm_send_confirmed("maintenance-done-ack", sms->sender, "Maintenance completed. Bin locked.");
-        ESP_LOGI(TAG, "Maintenance mode completed");
+        if (lid_ret == ESP_OK) {
+            gsm_send_confirmed("maintenance-done-ack", sms->sender,
+                               "Maintenance completed. Bin locked.");
+            ESP_LOGI(TAG, "Maintenance mode completed");
+        } else {
+            gsm_send_confirmed("maintenance-lock-failed", sms->sender,
+                               "Lock received, but lid motor failed. Check servo power.");
+            ESP_LOGE(TAG, "Maintenance lock failed: %s", esp_err_to_name(lid_ret));
+        }
     }
 }
 
@@ -1040,6 +1204,35 @@ static bool topic_extract_peer_id(const char *topic,
     return true;
 }
 
+static bool topic_extract_device_id(const char *topic,
+                                    const char *suffix,
+                                    char *id,
+                                    size_t id_size)
+{
+    const char *prefix = "devices/";
+    size_t prefix_len = strlen(prefix);
+
+    if (!topic || !suffix || !id || id_size == 0 ||
+        strncmp(topic, prefix, prefix_len) != 0) {
+        return false;
+    }
+
+    const char *start = topic + prefix_len;
+    const char *end = strstr(start, suffix);
+    if (!end || end == start) {
+        return false;
+    }
+
+    size_t len = (size_t)(end - start);
+    if (len >= id_size) {
+        len = id_size - 1;
+    }
+
+    memcpy(id, start, len);
+    id[len] = '\0';
+    return true;
+}
+
 static void peer_registry_mark_offline(const char *id)
 {
     if (!id || id[0] == '\0' || strcmp(id, s_bin_id) == 0) {
@@ -1066,7 +1259,8 @@ static void peer_registry_upsert(const char *id,
                                  const char *name)
 {
     if (!id || id[0] == '\0' || strcmp(id, s_bin_id) == 0 ||
-        lat == 0.0 || lon == 0.0) {
+        lat == 0.0 || lon == 0.0 ||
+        !gps_coords_plausible(lat, lon)) {
         return;
     }
 
@@ -1112,6 +1306,10 @@ static void peer_registry_upsert(const char *id,
     }
 
     if (peer) {
+        uint32_t now_s = get_time_ms() / 1000;
+        bool should_log = peer->id[0] == '\0' ||
+                          peer->fill != (uint8_t)fill ||
+                          (now_s - peer->last_seen) >= 10;
         memset(peer, 0, sizeof(*peer));
         strlcpy(peer->id, id, sizeof(peer->id));
         peer->lat = lat;
@@ -1119,10 +1317,16 @@ static void peer_registry_upsert(const char *id,
         peer->alt = alt;
         peer->fill = (uint8_t)fill;
         peer->active = true;
-        peer->last_seen = get_time_ms() / 1000;
+        peer->last_seen = now_s;
         strlcpy(peer->name, resolved_name, sizeof(peer->name));
-        ESP_LOGI(TAG, "Peer %s: fill=%d, name=%s", id, fill,
-                 peer->name[0] ? peer->name : "unmapped");
+        if (should_log) {
+            ESP_LOGI(TAG, "Peer %s: fill=%d, name=%s, gps=%.6f %.6f",
+                     id,
+                     fill,
+                     peer->name[0] ? peer->name : "unmapped",
+                     peer->lat,
+                     peer->lon);
+        }
     }
 
     xSemaphoreGive(s_peers_mutex);
@@ -1162,6 +1366,7 @@ static void mqtt_event_cb(mqtt_client_event_t event, void *data) {
         mqtt_client_subscribe("smartbin/discovery/announce", 1);
         mqtt_client_subscribe("smartbin/bin/+/state", 1);
         mqtt_client_subscribe("smartbin/bin/+/lwt", 1);
+        mqtt_client_subscribe("devices/+/data", 1);
         // Publish online status (retained)
         char topic[128];
         mqtt_topic_build(topic, sizeof(topic), "status/online");
@@ -1187,6 +1392,8 @@ static void mqtt_event_cb(mqtt_client_event_t event, void *data) {
             } else if (topic_extract_peer_id(topic, "/lwt", peer_id, sizeof(peer_id)) &&
                        strcmp(payload, "OFFLINE") == 0) {
                 peer_registry_mark_offline(peer_id);
+            } else if (topic_extract_device_id(topic, "/data", peer_id, sizeof(peer_id))) {
+                peer_registry_update_from_payload(peer_id, payload);
             }
         }
     }
@@ -1217,15 +1424,18 @@ static void mqtt_network_task(void *pvParameters)
     char lwt_topic[64];
     snprintf(lwt_topic, sizeof(lwt_topic), "smartbin/bin/%s/lwt", mac_str);
 
-    uint32_t last_publish = 0;
-    uint32_t last_heartbeat = 0;
-    uint32_t last_state = 0;
-    uint32_t last_expiry = 0;
-    uint32_t last_discovery = 0;
+    uint32_t last_publish_ms = 0;
+    uint32_t last_heartbeat_ms = 0;
+    uint32_t last_state_ms = 0;
+    uint32_t last_expiry_ms = 0;
+    uint32_t last_discovery_ms = 0;
+    uint8_t last_data_fill = UINT8_MAX;
+    uint8_t last_state_fill = UINT8_MAX;
     bool mqtt_initialised = false;
 
     while (1) {
-        uint32_t now = get_time_ms() / 1000;
+        uint32_t now_ms = get_time_ms();
+        uint32_t now = now_ms / 1000;
 
         // Attempt WiFi connection if not already connected
         if (!s_wifi_connected) {
@@ -1269,50 +1479,68 @@ static void mqtt_network_task(void *pvParameters)
 
         // If MQTT is connected, publish data
         if (s_mqtt_connected) {
-            // Publish data to devices/ topic every 10 seconds
-            if (last_publish == 0 || (now - last_publish) >= 10) {
+            uint8_t current_fill = s_current_fill;
+            bool data_fill_changed = (last_data_fill == UINT8_MAX ||
+                                      current_fill != last_data_fill);
+            bool state_fill_changed = (last_state_fill == UINT8_MAX ||
+                                       current_fill != last_state_fill);
+
+            // Publish dashboard data quickly. This is the main live web feed.
+            if (last_publish_ms == 0 ||
+                (now_ms - last_publish_ms) >= MQTT_DATA_PUBLISH_INTERVAL_MS) {
                 char topic[128];
                 mqtt_topic_build(topic, sizeof(topic), "data");
                 char payload[256];
-                format_local_bin_payload(payload, sizeof(payload), mac_str, now);
+                format_local_bin_payload(payload, sizeof(payload), mac_str, current_fill, now);
                 mqtt_client_publish(topic, payload, strlen(payload), 1, false);
-                last_publish = now;
+                last_publish_ms = now_ms;
+                last_data_fill = current_fill;
+                if (data_fill_changed) {
+                    ESP_LOGD(TAG, "Realtime MQTT data publish: fill=%d%%", current_fill);
+                }
             }
 
             // Publish discovery so nearby bins can build their redirect peer lists.
-            if (last_discovery == 0 || (now - last_discovery) >= 30) {
+            if (last_discovery_ms == 0 ||
+                (now_ms - last_discovery_ms) >= MQTT_DISCOVERY_PUBLISH_INTERVAL_MS) {
                 char payload[256];
-                format_local_bin_payload(payload, sizeof(payload), mac_str, now);
+                format_local_bin_payload(payload, sizeof(payload), mac_str, current_fill, now);
                 mqtt_client_publish("smartbin/discovery/announce",
                                     payload,
                                     strlen(payload),
                                     1,
                                     false);
-                last_discovery = now;
+                last_discovery_ms = now_ms;
             }
 
-            // Publish to smartbin/bin/<mac>/state every 30 seconds
-            if (last_state == 0 || (now - last_state) >= 30) {
+            // Publish peer/web state periodically, and sooner when fill changes.
+            if (last_state_ms == 0 ||
+                (now_ms - last_state_ms) >= MQTT_STATE_PUBLISH_INTERVAL_MS ||
+                (state_fill_changed &&
+                 (now_ms - last_state_ms) >= MQTT_STATE_CHANGE_MIN_INTERVAL_MS)) {
                 char topic[128];
                 snprintf(topic, sizeof(topic), "smartbin/bin/%s/state", mac_str);
                 char payload[256];
-                format_local_bin_payload(payload, sizeof(payload), mac_str, now);
+                format_local_bin_payload(payload, sizeof(payload), mac_str, current_fill, now);
                 mqtt_client_publish(topic, payload, strlen(payload), 1, false);
-                last_state = now;
+                last_state_ms = now_ms;
+                last_state_fill = current_fill;
             }
 
-            // Publish to smartbin/cloud/bin/<mac>/heartbeat every 30 seconds
-            if (last_heartbeat == 0 || (now - last_heartbeat) >= 30) {
+            // Heartbeat proves liveness, but live fill updates come from data/state.
+            if (last_heartbeat_ms == 0 ||
+                (now_ms - last_heartbeat_ms) >= MQTT_HEARTBEAT_PUBLISH_INTERVAL_MS) {
                 char topic[128];
                 snprintf(topic, sizeof(topic), "smartbin/cloud/bin/%s/heartbeat", mac_str);
                 char payload[256];
-                format_local_bin_payload(payload, sizeof(payload), mac_str, now);
+                format_local_bin_payload(payload, sizeof(payload), mac_str, current_fill, now);
                 mqtt_client_publish(topic, payload, strlen(payload), 1, false);
-                last_heartbeat = now;
+                last_heartbeat_ms = now_ms;
             }
 
             // Expire old peers
-            if ((now - last_expiry) >= 10) {
+            if (last_expiry_ms == 0 ||
+                (now_ms - last_expiry_ms) >= MQTT_PEER_EXPIRY_CHECK_INTERVAL_MS) {
                 if (xSemaphoreTake(s_peers_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
                     for (int i = 0; i < MAX_PEERS; i++) {
                         if (s_peers[i].active &&
@@ -1322,7 +1550,7 @@ static void mqtt_network_task(void *pvParameters)
                     }
                     xSemaphoreGive(s_peers_mutex);
                 }
-                last_expiry = now;
+                last_expiry_ms = now_ms;
             }
         }
 
@@ -1335,6 +1563,7 @@ static void control_task(void *pvParameters) {
     bool pir_detected = false;
     bool full_mode_active = false;
     bool full_user_mode = false;
+    uint32_t last_maintenance_hold_ms = 0;
     while (1) {
         uint32_t now = get_time_ms();
         pir_driver_read(s_pir, &pir_detected);
@@ -1352,6 +1581,18 @@ static void control_task(void *pvParameters) {
         } else {
             // No significant change, keep previous stable value
             // s_current_fill remains unchanged
+        }
+
+        if (s_maintenance_unlocked || s_state == STATE_MAINTENANCE) {
+            s_state = STATE_MAINTENANCE;
+            if ((now - last_maintenance_hold_ms) >= MAINTENANCE_SERVO_HOLD_MS) {
+                lid_open("maintenance hold");
+                last_maintenance_hold_ms = now;
+            }
+            update_leds(STATE_MAINTENANCE);
+            update_lcd_gps_fill();
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
         }
 
         bool bin_full = (s_current_fill >= FULL_PERCENT);
@@ -1408,7 +1649,7 @@ static void control_task(void *pvParameters) {
                 break;
             case STATE_ATTENTION:
                 if (hand) {
-                    servo_driver_set_angle(s_servo, 90.0f);
+                    lid_open("user waste deposit");
                     vTaskDelay(pdMS_TO_TICKS(100));
                     s_state = STATE_LID_OPEN;
                     s_lid_open_start_time = now;
@@ -1423,7 +1664,7 @@ static void control_task(void *pvParameters) {
                 break;
             case STATE_LID_OPEN:
                 if ((now - s_lid_open_start_time) > LID_OPEN_DURATION_MS) {
-                    servo_driver_set_angle(s_servo, 0.0f);
+                    lid_close("auto close after deposit");
                     vTaskDelay(pdMS_TO_TICKS(100));
                     s_state = STATE_LID_CLOSE_WAIT;
                     update_leds(s_state);
@@ -1450,8 +1691,9 @@ static void control_task(void *pvParameters) {
 /* ========== Driver Initialisation ========== */
 static esp_err_t init_drivers(void) {
     s_gps_mutex = xSemaphoreCreateMutex();
+    s_servo_mutex = xSemaphoreCreateMutex();
     s_peers_mutex = xSemaphoreCreateMutex();
-    if (!s_gps_mutex || !s_peers_mutex) return ESP_ERR_NO_MEM;
+    if (!s_gps_mutex || !s_servo_mutex || !s_peers_mutex) return ESP_ERR_NO_MEM;
 
     // I2C bus
     i2c_master_bus_config_t bus_cfg = {
@@ -1526,7 +1768,7 @@ static esp_err_t init_drivers(void) {
     ret = buzzer_driver_create(&buzzer_cfg, &s_buzzer);
     if (ret != ESP_OK) return ret;
 
-    servo_driver_set_angle(s_servo, 0.0f);
+    lid_close("startup close");
     vTaskDelay(pdMS_TO_TICKS(500));
     ESP_LOGI(TAG, "All drivers initialised");
     return ESP_OK;
@@ -1547,9 +1789,9 @@ void app_main(void)
     }
 
     // Quick servo test
-    servo_driver_set_angle(s_servo, 90.0f);
+    lid_open("startup servo test");
     vTaskDelay(pdMS_TO_TICKS(1500));
-    servo_driver_set_angle(s_servo, 0.0f);
+    lid_close("startup servo test");
     vTaskDelay(pdMS_TO_TICKS(1500));
 
     xTaskCreate(gps_task, "gps", 4096, NULL, 3, NULL);
