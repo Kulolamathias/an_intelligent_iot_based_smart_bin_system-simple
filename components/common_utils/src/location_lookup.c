@@ -11,6 +11,30 @@ typedef struct {
     const char *name;
 } known_place_t;
 
+typedef struct {
+    double center_lat;
+    double center_lon;
+    double radius_m;
+    const char *name;
+} known_zone_t;
+
+static const known_zone_t s_known_zones[] = {
+    { -6.215440, 35.813713, 120.0, "Block 37A" },
+    { -6.212494, 35.814347, 140.0, "NJE Block 1" },
+    { -6.216124, 35.813004, 100.0, "Ecowater" },
+    { -6.216025, 35.812564, 100.0, "Library" },
+    { -6.216760, 35.810982, 140.0, "Auditorium" },
+    { -6.217032, 35.808745, 180.0, "Administration" },
+    { -6.216071, 35.808669, 170.0, "Academic" },
+    { -6.214848, 35.808152, 170.0, "EGA" },
+    { -6.214269, 35.808463, 140.0, "LRA" },
+    { -6.214982, 35.809173, 180.0, "LRB" },
+    { -6.213529, 35.809593, 170.0, "LRB Parking" },
+    { -6.215141, 35.809426, 180.0, "MULTLAB" },
+    { -6.214895, 35.811680, 190.0, "Cafeteria" },
+    { -6.217500, 35.806702, 160.0, "Sports Field" },
+};
+
 static const known_place_t s_known_places[] = {
     // Block / outer block area
     { -6.215477, 35.813713, "Block 37A" },
@@ -73,6 +97,7 @@ static const known_place_t s_known_places[] = {
 };
 
 #define NUM_KNOWN_PLACES (sizeof(s_known_places) / sizeof(s_known_places[0]))
+#define NUM_KNOWN_ZONES (sizeof(s_known_zones) / sizeof(s_known_zones[0]))
 
 /* Maximum distance (meters) to consider a campus-area name match.
  * GPS readings around buildings can drift, so keep this practical for demos.
@@ -100,6 +125,10 @@ bool location_lookup_find(double lat, double lon, char *name_buf, size_t buf_siz
         return false;
     }
 
+    if (location_lookup_find_zone(lat, lon, name_buf, buf_size, NULL, NULL)) {
+        return true;
+    }
+
     double best_dist = MATCH_DISTANCE_M + 1.0;
     const char *best_name = NULL;
 
@@ -119,4 +148,48 @@ bool location_lookup_find(double lat, double lon, char *name_buf, size_t buf_siz
 
     name_buf[0] = '\0';
     return false;
+}
+
+bool location_lookup_find_zone(double lat,
+                               double lon,
+                               char *name_buf,
+                               size_t buf_size,
+                               double *distance_m,
+                               double *radius_m)
+{
+    if (name_buf == NULL || buf_size == 0) {
+        return false;
+    }
+
+    const known_zone_t *best_zone = NULL;
+    double best_dist = 0.0;
+    double best_score = 9999.0;
+
+    for (size_t i = 0; i < NUM_KNOWN_ZONES; i++) {
+        double dist = haversine(lat,
+                                lon,
+                                s_known_zones[i].center_lat,
+                                s_known_zones[i].center_lon);
+        double score = dist / s_known_zones[i].radius_m;
+        if (dist <= s_known_zones[i].radius_m && score < best_score) {
+            best_score = score;
+            best_dist = dist;
+            best_zone = &s_known_zones[i];
+        }
+    }
+
+    if (!best_zone) {
+        name_buf[0] = '\0';
+        return false;
+    }
+
+    strncpy(name_buf, best_zone->name, buf_size - 1);
+    name_buf[buf_size - 1] = '\0';
+    if (distance_m) {
+        *distance_m = best_dist;
+    }
+    if (radius_m) {
+        *radius_m = best_zone->radius_m;
+    }
+    return true;
 }

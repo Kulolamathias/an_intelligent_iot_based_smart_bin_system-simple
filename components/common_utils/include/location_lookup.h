@@ -19,6 +19,23 @@ extern "C" {
 bool location_lookup_find(double lat, double lon, char *name_buf, size_t buf_size);
 
 /**
+ * @brief Find a canonical assessment zone using a center/radius model.
+ * @param lat Latitude (degrees)
+ * @param lon Longitude (degrees)
+ * @param name_buf Output canonical zone name
+ * @param buf_size Size of name_buf
+ * @param distance_m Optional distance from zone center
+ * @param radius_m Optional matching radius used for the zone
+ * @return true if coordinates fall inside a known zone
+ */
+bool location_lookup_find_zone(double lat,
+                               double lon,
+                               char *name_buf,
+                               size_t buf_size,
+                               double *distance_m,
+                               double *radius_m);
+
+/**
  * @brief (Future) Add or update a place in NVS – stub for now.
  */
 // esp_err_t location_lookup_add(double lat, double lon, const char *name);
